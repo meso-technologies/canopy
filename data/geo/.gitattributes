@@ -1,0 +1,2 @@
+# Treat all hlz_ files as binary (no line ending conversion)
+hlz_* -text

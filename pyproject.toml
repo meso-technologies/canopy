@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canopy"
+version = "0.1.0"
+description = "Meso Taxonomy Importer Pipeline"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+	"aiohttp",
+	"aiofiles",
+	"duckdb",
+	"pyarrow",
+	"polars",
+	"numpy",
+	"faiss-cpu",
+	"psutil",
+	"requests"
+]
+
+[tool.setuptools]
+package-dir = {"" = ".."}
+packages = ["importer.canopy", "importer.canopy.config", "importer.canopy.datasets", "importer.canopy.utils", "importer.canopy.pipeline"]
+
+[tool.uv]
+dev-dependencies = []

@@ -1,0 +1,21 @@
+# Keep these folder names visible from one central gitignore
+!source/
+!temp/
+!processed/
+!releases/
+!geo/
+!apis/
+
+# Ignore all runtime data contents
+source/**
+temp/**
+processed/**
+releases/**
+geo/**
+apis/**
+
+# Keep geo attribute policy tracked for binary raster side files
+!geo/.gitattributes
+
+# Keep this gitignore tracked
+!.gitignore
