@@ -25,7 +25,8 @@ from ..utils.queries import name_cleanup, find_hybrids, build_rank_and_status, v
 
 source = {
     "name": "inaturalist",
-    "url": "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip",
+    # ChecklistBank mirror is accessible without Cloudflare challenge and provides stable issued timestamps
+    "url": "https://api.checklistbank.org/dataset/139831/archive.zip",
 	"citation": '<a href="https://www.inaturalist.org" class="medium">iNaturalist</a>, iNaturalist Contributors. iNaturalist Backbone Data. Version YYYY-MM-DD. iNaturalist. <a href="https://www.inaturalist.org" class="medium">https://www.inaturalist.org</a>'
 }
 

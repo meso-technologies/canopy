@@ -12,8 +12,6 @@ from ..utils.filehandlers import get_latest_release, get_file
 from ..datasets.occurrences import update_occurrences
 # Load DuckDB for spatial SQL processing
 import duckdb
-# Load DuckDB typing aliases used by UDF registration
-from duckdb.typing import *
 # Load Arrow chunk arrays for FAISS UDF bridge
 import pyarrow as pa
 # Load NumPy for cluster math and distance checks

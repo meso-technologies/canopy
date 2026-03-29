@@ -84,7 +84,7 @@ def process_wikidata(source: Dict):
 		db.execute(f"""
 			CREATE TEMPORARY TABLE wikidata_parsed AS SELECT
 				id, claims AS jclaims, labels AS jlabels, aliases AS jaliases, sitelinks AS jsitelinks
-			FROM read_json('{ os.path.join(TMP_DIR,filtered)}', format='newline_delimited', ignore_errors=True, maximum_depth=6)
+			FROM read_json('{ os.path.join(TMP_DIR,filtered)}', format='newline_delimited', ignore_errors=True, maximum_depth=6, map_inference_threshold=100)
 			-- Only Q-entities (skip P-property definitions that slip through the filter)
 			WHERE starts_with(id, 'Q')
 			{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
@@ -215,8 +215,8 @@ def process_wikidata(source: Dict):
 		# Get vernacular names
 		wikidata_vernacular(db, source)
 		# Debug: spot-check psychoactive taxa and top taxa by Wikipedia presence
-		db.sql("SELECT * FROM wikidata WHERE psychoactive = true").show(max_rows=200)
-		db.sql(f"SELECT id_raw, name_raw, ipni_id, fungorum_id, page_count, vernacular FROM wikidata ORDER BY page_count DESC;").show(max_rows=200)
+		db.sql("SELECT * FROM wikidata WHERE psychoactive = true LIMIT 200").show(max_rows=200)
+		db.sql(f"SELECT id_raw, name_raw, ipni_id, fungorum_id, page_count, vernacular FROM wikidata ORDER BY page_count DESC LIMIT 200;").show(max_rows=200)
 		# Final validation
 		validate(db,source)
 		# Write to disc

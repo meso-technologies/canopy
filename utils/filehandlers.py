@@ -30,7 +30,8 @@ async def fetch(session, source: dict) -> bool:
 			source['latest_processed'] = latest_processed
 			source['timestamp_processed'] = int(latest_processed.split('.')[1])
 	# Check if we even have something to process at this point
-	if not source.get('timestamp_download'): return False
+	# Use explicit None check so legacy datehash 0 files still count as available local sources
+	if source.get('timestamp_download') is None: return False
 	# Check if we need to process
 	if not source.get('timestamp_processed') or (source.get('timestamp_download') and source.get('timestamp_processed') < source.get('timestamp_download')):
 		print(f"IMPORT : Processed { source['name']} version outdated, we have { source.get('timestamp_processed') } but { source.get('timestamp_download') } is available.")

@@ -1,5 +1,7 @@
 # Load traceback helpers for readable failure output
 import traceback
+# Load process exit helper for non-zero failure signaling
+import sys
 # Load CLI argument parsing
 import argparse
 # Load async runtime primitives
@@ -50,6 +52,8 @@ async def main(argv=None):
 	timeout = aiohttp.ClientTimeout(total=60 * 120)
 	# Protect full pipeline execution with top-level error handling
 	try:
+		# Track stage-level failures so wrapper can stop on canopy errors
+		had_errors = False
 		# Collect per-source processing metadata for downstream fusion/diff
 		results = {}
 		# Run source stage when explicitly requested or when no later-only flags were provided
@@ -80,14 +84,18 @@ async def main(argv=None):
 					if args.dataset and args.dataset not in sources:
 						# Report invalid dataset selection to the caller
 						print('CANOPY : Invalid dataset specified')
-						# Exit early because nothing valid can run
-						return None
+						# Fail fast so wrapper can stop and report invalid CLI input
+						raise ValueError('Invalid dataset specified')
 				# Handle cooperative cancellation cleanly
 				except* asyncio.CancelledError:
+					# Mark grouped cancellation as failure for wrapper orchestration
+					had_errors = True
 					# Log cancellation reason for operator visibility
 					print('CANOPY : Tasks cancelled - shutting down...')
 				# Report grouped stage exceptions without losing stack traces
 				except* Exception as eg:
+					# Mark grouped dataset failures so process exits non-zero
+					had_errors = True
 					# Announce grouped dataset failures
 					print('CANOPY : Some tasks failed:')
 					# Print each underlying exception from the exception group
@@ -114,26 +122,50 @@ async def main(argv=None):
 				release = fuse(results)
 			# Handle user aborts during long fusion queries
 			except KeyboardInterrupt:
+				# Mark cancellation as failure for wrapper orchestration
+				had_errors = True
 				# Confirm clean cancellation to operator logs
 				print('CANOPY : Fusion cancelled by user.')
 			# Surface fusion failures with full traceback context
 			except Exception as e:
+				# Mark fusion failure so process exits non-zero
+				had_errors = True
 				# Emit concise error summary for quick scanning
 				print(f'CANOPY : Error during fusion: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
 				traceback.print_exception(type(e), e, e.__traceback__)
+		# Abort follow-up stages immediately when earlier stages failed
+		if had_errors: raise RuntimeError('Canopy stage errors detected')
 		# Run geospatial stage only when requested
 		if args.geo:
-			# Import geo stage lazily to avoid optional dependency cost unless needed
-			from .pipeline.geo import compute_geospatial
-			# Execute geospatial enrichment against the chosen release
-			await compute_geospatial(release)
+			try:
+				# Import geo stage lazily to avoid optional dependency cost unless needed
+				from .pipeline.geo import compute_geospatial
+				# Execute geospatial enrichment against the chosen release
+				await compute_geospatial(release)
+			except Exception as e:
+				# Mark geo failure so process exits non-zero
+				had_errors = True
+				# Emit concise error summary for quick scanning
+				print(f'CANOPY : Error during geo: {type(e).__name__}: {str(e)}')
+				# Emit full traceback for debugging
+				traceback.print_exception(type(e), e, e.__traceback__)
 		# Run API enrichment stage only when requested
 		if args.apis:
-			# Import Wikipedia updater lazily for optional API dependency paths
-			from .datasets.wikipedia import update_wikipedia
-			# Execute API refresh/update workflow
-			update_wikipedia(release)
+			try:
+				# Import Wikipedia updater lazily for optional API dependency paths
+				from .datasets.wikipedia import update_wikipedia
+				# Execute API refresh/update workflow
+				update_wikipedia(release)
+			except Exception as e:
+				# Mark API stage failure so process exits non-zero
+				had_errors = True
+				# Emit concise error summary for quick scanning
+				print(f'CANOPY : Error during apis: {type(e).__name__}: {str(e)}')
+				# Emit full traceback for debugging
+				traceback.print_exception(type(e), e, e.__traceback__)
+		# Abort with non-zero exit semantics when any stage failed
+		if had_errors: raise RuntimeError('Canopy stage errors detected')
 		# Return release metadata for wrapper orchestration and distill handoff
 		return release
 	# Catch any unhandled runtime failure in canopy flow
@@ -142,6 +174,8 @@ async def main(argv=None):
 		print(f'CANOPY : Unhandled exception {type(e).__name__}: {str(e)}')
 		# Emit full traceback for postmortem debugging
 		traceback.print_exception(type(e), e, e.__traceback__)
+		# Re-raise so CLI process exits non-zero and wrapper can stop
+		raise
 	# Catch cancellation propagated to top-level runner
 	except asyncio.exceptions.CancelledError:
 		# Confirm cancellation in logs
@@ -163,3 +197,5 @@ if __name__ == '__main__':
 		print(f'CANOPY : Unhandled error {type(e).__name__}: {e}.')
 		# Emit stack for debugging unexpected top-level failures
 		traceback.print_stack()
+		# Exit non-zero so wrapper orchestration can stop safely
+		sys.exit(1)

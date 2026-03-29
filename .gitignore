@@ -1,6 +1,15 @@
 # Local canopy secrets
 config/secrets.py
 
+# Local virtual environment
+.venv/
+
+# Local packaging artifacts from editable installs
+*.egg-info/
+
+# Local uv lockfile for monorepo dev runtime
+uv.lock
+
 # Python cache artifacts
 **/__pycache__/
 *.pyc

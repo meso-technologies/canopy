@@ -21,7 +21,6 @@ from ..utils.filehandlers import check_release, get_latest_processed
 from ..utils.queries import write_to_disc
 # DB
 import duckdb
-from duckdb.typing import VARCHAR
 # UDFs
 import uuid
 import pyarrow as pa
@@ -118,7 +117,7 @@ def load_map_sources(results: dict, db: duckdb.DuckDBPyConnection):
 	# CoL (plants and fungi) and Tropicos (name matching only) should come last
 	for source in core_authorities: load_parquet(results,db,source)
 	# Fetch taxon rank Enum from canopy config
-	from .config.enums import TaxonRank
+	from ..config.enums import TaxonRank
 	# Create enum for ranks
 	db.execute(f"""CREATE TYPE taxon_rank_enum AS ENUM ('{"', '".join([e.name for e in TaxonRank])}')""")
 	# Create enum for sources
@@ -536,9 +535,15 @@ def enrich(results: dict, db: duckdb.DuckDBPyConnection):
 	print(f"""IMPORT : Added annual/perennial values from POWO and WCVP""")	
 	# Add native habitats and regions
 	for tdwgcolumn in ['native_to','regions']:
-		db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS { tdwgcolumn } VARCHAR[] DEFAULT [];""")	
+		# Avoid list defaults in ALTER TABLE here because DuckDB can hit non-flat vector internal errors
+		db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS { tdwgcolumn } VARCHAR[];""")
 		for source in ['col','gbif','wcvp']:
-			db.execute(f"""UPDATE meso SET { tdwgcolumn } = list_distinct(list_concat(meso.{ tdwgcolumn },{source}.{ tdwgcolumn })) FROM {source} WHERE meso.{source}_id = {source}.id_raw;""")
+			db.execute(f"""
+				UPDATE meso
+				SET { tdwgcolumn } = list_distinct(list_concat(COALESCE(meso.{ tdwgcolumn }, ARRAY[]::VARCHAR[]), COALESCE({source}.{ tdwgcolumn }, ARRAY[]::VARCHAR[])))
+				FROM {source}
+				WHERE meso.{source}_id = {source}.id_raw;
+			""")
 		db.execute(f"""UPDATE meso SET { tdwgcolumn } = NULL WHERE len({ tdwgcolumn }) = 0;""")
 		sql = f"SELECT COUNT(*) FROM meso WHERE { tdwgcolumn } IS NOT NULL"
 		print(f"""IMPORT : Added { tdwgcolumn } to {db.execute(sql).fetchone()[0]:,} entries""")
@@ -681,7 +686,7 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 	print("IMPORT : Collapsed name lists that only had a single unique value after Levenshtein processing")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular ORDER BY id_meso DESC").show()
 	# Register UDF
-	vernacular_struct = duckdb.struct_type({"lang": duckdb.sqltype("VARCHAR"),"names": duckdb.list_type(VARCHAR)})
+	vernacular_struct = duckdb.struct_type({"lang": duckdb.sqltype("VARCHAR"),"names": duckdb.list_type(duckdb.sqltype("VARCHAR"))})
 	db.create_function('vernacular_udf', vernacular_udf, [vernacular_struct], 'VARCHAR[]', type='arrow')
 	# Process long name arrays in polars
 	db.execute(f"""UPDATE merged_vernacular SET names = vernacular_udf(struct_pack(lang := lang, names := names)) WHERE len(names) > 1""")	
@@ -1330,8 +1335,24 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 				""")
 				print(f"IMPORT : Fetched Meso IDs of {authority} parents")
 			case 'rank_clean':
-				# Uppercase rank values to match our enum
-				db.execute(f"""UPDATE meso m SET {fieldname}_{authority} = upper(a.{column}) FROM {authority} a WHERE m.{authority}_id = a.id_raw;""")
+				# Uppercase rank values to match our enum and skip values outside enum labels
+				db.execute(f"""
+					UPDATE meso m SET {fieldname}_{authority} = upper(a.{column}) FROM {authority} a
+					WHERE m.{authority}_id = a.id_raw
+					AND a.{column} IS NOT NULL
+					AND upper(a.{column}) IN (SELECT unnest(enum_range(NULL::taxon_rank_enum)));
+				""")
+				# Log source rows with invalid rank labels (e.g. greek rank markers) that were skipped
+				result = db.sql(f"""
+					SELECT id_raw, name_clean, {column}
+					FROM {authority}
+					WHERE {column} IS NOT NULL
+					AND upper({column}) NOT IN (SELECT unnest(enum_range(NULL::taxon_rank_enum)));
+				""")
+				rowcount = result.arrow().read_all().num_rows
+				if rowcount > 0:
+					print(f"IMPORT : Skipped {rowcount:,} invalid ranks from {authority}")
+					if settings.VERBOSE: result.show(max_rows=20)
 			case 'year':
 				# Only set year values that are between 1700 and current year
 				db.execute(f"""

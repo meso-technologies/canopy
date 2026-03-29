@@ -17,12 +17,12 @@ dependencies = [
 	"numpy",
 	"faiss-cpu",
 	"psutil",
-	"requests"
+	"requests",
+	"fsspec",
+	"pandas"
 ]
 
 [tool.setuptools]
-package-dir = {"" = ".."}
+package-dir = {"importer" = ".."}
 packages = ["importer.canopy", "importer.canopy.config", "importer.canopy.datasets", "importer.canopy.utils", "importer.canopy.pipeline"]
 
-[tool.uv]
-dev-dependencies = []

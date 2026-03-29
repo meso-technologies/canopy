@@ -2,33 +2,31 @@
 
 Standalone taxonomy pipeline extracted from Meso importer.
 
-## Install with uv
+## Setup
 
 ```bash
 cd data/importer/canopy
-uv venv
-uv pip install -e .
+bash ./setup.sh
+```
+
+## Update
+
+```bash
+cd data/importer/canopy
+bash ./update.sh
 ```
 
 ## Run
 
-Create canopy data folders once:
-
-```bash
-mkdir -p data/{source,temp,processed,releases,geo,apis}
-```
-
-Then run canopy:
-
 ```bash
 # Download only
-python -m importer.canopy.run --download
+uv run python -m importer.canopy.run --download
 
 # Process + fuse + geo + APIs
-python -m importer.canopy.run --process --fuse --geo --apis
+uv run python -m importer.canopy.run --process --fuse --geo --apis
 
 # Fast partial debug run
-python -m importer.canopy.run --debug --process --fuse
+uv run python -m importer.canopy.run --debug --process --fuse
 ```
 
 ## Secrets
