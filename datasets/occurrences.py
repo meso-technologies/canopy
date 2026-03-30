@@ -8,7 +8,7 @@
 #		TODO: Add eventdate as first observation signal alongside BHL first mention
 #
 # Basics
-import os, io, requests, aiohttp, json, time, asyncio
+import os, io, aiohttp, json, asyncio
 from datetime import datetime, timezone, timedelta
 # Internal
 from .. import TMP_DIR, GEO_DIR, settings
@@ -26,56 +26,82 @@ GBIF_API_HOST = 'https://api.gbif.org/v1/'
 
 # Main function 
 async def update_occurrences():
+	# Resolve path to rolling occurrence parquet
 	file = os.path.join(GEO_DIR, f"occurrences.parquet")
 	# Skip GBIF API update when credentials are missing
 	if not settings.GBIF_USER or not settings.GBIF_PASSWORD:
+		# Soft-skip when we already have a local occurrence baseline
 		if os.path.isfile(file):
 			print('IMPORT : GBIF credentials missing, skipping occurrence update and reusing local occurrences.parquet')
 			return
+		# Hard-stop bootstrap when there is no local baseline at all
 		print('IMPORT : GBIF credentials missing, skipping occurrence bootstrap')
 		print('IMPORT : Register credentials at https://www.gbif.org/user/profile and set them in canopy/secrets.py')
-		return
-	# Check if we alrady have processed GBIF data locally
+		raise RuntimeError('No local GBIF occurrences.parquet and no GBIF credentials available')
+	# Bootstrap when no processed occurrence parquet exists yet
 	if not os.path.isfile(file):
+		# Log bootstrap path
 		print(f"IMPORT : No processed GBIF occurrence dataset found")
-		# Check for raw data
-		if not os.path.isfile(os.path.join(TMP_DIR, f"occurrences.zip")):	
-			print("IMPORT : Downloading raw GBIF data (200GB, this might take a while)")
-			# Start download if we don't have any local data
-			# GBIF generally only allows one connection at time, but we try anyway
-			await aria_download('occurrences.zip', get_latest_url(), 8, TMP_DIR)
-			# Create initial manifest
-			with open(os.path.join(GEO_DIR,'manifest.json'),'w') as f: json.dump({ 'initial_download': datetime.now(timezone.utc).isoformat() }, f, indent=4)	
-		# Then process
-		distill_occurrences()		
-	else: 
-		print(f"IMPORT : Processed GBIF occurrence data found")	
-		# Otherwise get more recent occurrences via API
-		await get_latest_occurrences(file)
+		# Reuse already downloaded bootstrap zip only when it is valid
+		bootstrap_zip = os.path.join(TMP_DIR, 'occurrences.zip')
+		if os.path.isfile(bootstrap_zip):
+			# Ignore stale/corrupt bootstrap zips from interrupted downloads
+			if not is_valid_zip(bootstrap_zip):
+				print('IMPORT : Existing occurrences.zip is invalid, deleting and re-downloading')
+				os.remove(bootstrap_zip)
+			# Otherwise process existing bootstrap zip into geoparquet
+			else:
+				distill_occurrences()
+				# Ensure manifest exists after local bootstrap processing
+				manifest = get_manifest() or {}
+				manifest['initial_download'] = manifest.get('initial_download') or datetime.now(timezone.utc).isoformat()
+				save_manifest(manifest)
+				return
+		# Log API bootstrap request path
+		print('IMPORT : Requesting initial GBIF occurrences export via API (plants and fungi only)')
+		# Get auth for entire session
+		auth = BasicAuth(settings.GBIF_USER, settings.GBIF_PASSWORD)
+		# Spawn async http session for bootstrap request polling and download
+		async with aiohttp.ClientSession(auth=auth, headers={"User-Agent": user_agent}) as session:
+			# Load or initialize occurrence manifest
+			manifest = get_manifest() or {}
+			# Request bootstrap export when there is no pending key yet
+			if not manifest.get('current_download_key'):
+				# Start a full initial export limited to required kingdoms and coordinate quality
+				await request_update_from_gbif(session, manifest, initial=True)
+			# Resolve the pending request key
+			pending_key = manifest.get('current_download_key')
+			# Hard-fail bootstrap if GBIF did not accept request creation
+			if not pending_key: raise RuntimeError('Initial GBIF occurrence export request failed')
+			# Resolve ready download URL for pending key
+			url = await get_gbif_download_url(session, manifest)
+			# Hard-fail bootstrap when export is still being prepared
+			if not url: raise RuntimeError('Initial GBIF occurrence export not ready yet please retry in 1 to 2 hours')
+			# Download pending initial export with readiness polling
+			success = await download_pending_occurrence_file(session, url, 'occurrences.zip', manifest)
+			# Hard-fail bootstrap when file is not ready/downloadable yet
+			if not success: raise RuntimeError('Initial GBIF occurrence export not ready yet please retry in 1 to 2 hours')
+		# Convert bootstrap zip into rolling geoparquet baseline
+		distill_occurrences()
+		# Persist bootstrap completion in manifest
+		manifest = get_manifest() or {}
+		manifest['initial_download'] = manifest.get('initial_download') or datetime.now(timezone.utc).isoformat()
+		manifest['last_processed_download_key'] = manifest.get('current_download_key')
+		save_manifest(manifest)
+		# Stop after successful bootstrap
+		return
+	# Otherwise update existing baseline incrementally
+	print(f"IMPORT : Processed GBIF occurrence data found")
+	# Run incremental update flow
+	await get_latest_occurrences(file)
 
-# Look up latest full dataset version when we bootstrap the initial source dataset
-def get_latest_url():
-	# Fetch session
-	session = requests.Session()
-	# Say hi
-	session.headers.update({'User-Agent': user_agent})
-	# Fetch
-	response = session.get("https://www.gbif.org/api/occurrence-snapshots?limit=50&offset=0")
-	# Get data
-	data = response.json()
-	# Sanity
-	if not response or response.status_code != 200 or not data or 'results' not in data: return None
-	# Iterate
-	for dataset in data['results']:
-		# Ignore other datasets
-		if not dataset.get('request') or dataset['request'].get('format') != 'SIMPLE_PARQUET' or dataset['request'].get('predicate'): continue
-		# See if it's succeeded or still in progress
-		if not dataset.get('status') == 'SUCCEEDED': continue
-		# Final size check, using slightly smaller values than May 1st 2025 as reference as this shouldn't shrink
-		if int(dataset.get('size')) < 200845216598 or int(dataset.get('totalRecords')) < 3009166525: continue
-		# Return
-		return dataset.get('downloadLink')
-	
+# Persist manifest JSON to disk in one place
+# so all update/bootstrap paths keep state consistently
+
+def save_manifest(manifest: dict):
+	# Write manifest atomically from in-memory dict
+	with open(os.path.join(GEO_DIR,'manifest.json'),'w') as f: json.dump(manifest, f, indent=4)
+
 # Kick off and wait for an occurrence update
 async def get_latest_occurrences(file):
 	# Get auth for entire session
@@ -84,113 +110,101 @@ async def get_latest_occurrences(file):
 	async with aiohttp.ClientSession(auth=auth,headers={"User-Agent": user_agent}) as session:
 		# Get current manifest
 		manifest = get_manifest()
-		# Sanity
-		if not manifest: 
-			print(f"IMPORT : No GBIF occurrence manifest found!")
+		# Soft-skip incremental updates if manifest is missing on existing local baseline
+		if not manifest:
+			print(f"IMPORT : No GBIF occurrence manifest found, skipping incremental update")
 			return
-		# Check if we have any reason to update, eitehr because we never requested a download yet or it's less than 24h old
+		# Check if we have any reason to update, either because we never requested a download yet or it's older than 24h
 		if 'latest_download_request' in manifest and datetime.now(timezone.utc) - datetime.fromisoformat(manifest['latest_download_request']) <= timedelta(days=1):
 			print(f"IMPORT : Already requested occurrence update { manifest.get('current_download_key') } within the last 24 hours")
 		# Otherwise request a new dataset download
-		else: await request_update_from_gbif(session, manifest)
+		else: await request_update_from_gbif(session, manifest, initial=False)
 		# Check if we have a pending update that hasn't been processed yet
 		if 'last_processed_download_key' not in manifest or manifest.get('current_download_key') != manifest.get('last_processed_download_key'):
 			# Try processing a pending update
 			url = await get_gbif_download_url(session, manifest)
-			# If we got a URL back
-			if url: 
-				# Set a filename
-				filename = f"occurrence_update.{ manifest.get('current_download_key') }.zip"
-				# Download if we didn't yet
-				if not os.path.isfile(os.path.join(TMP_DIR, filename)): 
-					# Wait up to 10 minutes for file to be ready
-					for attempt in range(60):  
-						async with session.head(url) as head_resp:
-							if head_resp.status == 200:
-								content_length = head_resp.headers.get('Content-Length')
-								if content_length and int(content_length) > 1000:
-									break
-						if attempt < 59:
-							print(f"IMPORT : File not ready, checking again in 20 seconds...")
-							await asyncio.sleep(20)
-					else:
-						print(f"IMPORT : File still not ready after 20 minutes")
-						return
-					# Wait for GBIF to report a stable file size before downloading
-					expected_size = 0
-					for size_check in range(30):
-						async with session.head(url) as size_resp:
-							if size_resp.status == 200 and size_resp.headers.get('Content-Length'):
-								expected_size = int(size_resp.headers['Content-Length'])
-								if expected_size > 1000:
-									print(f"IMPORT : GBIF reports {expected_size:,} bytes for {filename}")
-									break
-						print(f"IMPORT : Waiting for GBIF to finalize file size...")
-						await asyncio.sleep(20)
-					# Download the file via aria
-					success = await aria_download(filename, url, 4, TMP_DIR)
-					# Update manifest
-					if success:
-						manifest['latest_download'] = datetime.now(timezone.utc).isoformat()
-						with open(os.path.join(GEO_DIR,'manifest.json'),'w') as f: json.dump(manifest, f, indent=4)
-				# Set success if we already had
-				else: success = True
-				# If we were successful, process incremental update with DuckDB
-				if success: process_incremental_update(manifest, filename)
+			# Soft-skip when GBIF is still preparing incremental export
+			if not url:
+				print('IMPORT : Incremental GBIF occurrence export not ready yet, will retry in next run')
+				return
+			# Set a filename for pending incremental export
+			filename = f"occurrence_update.{ manifest.get('current_download_key') }.zip"
+			# Download with readiness checks (or reuse existing file)
+			success = await download_pending_occurrence_file(session, url, filename, manifest)
+			# Soft-skip when file is still not ready
+			if not success:
+				print('IMPORT : Incremental GBIF occurrence export file not ready yet, will retry in next run')
+				return
+			# Process successful incremental zip into rolling geoparquet
+			process_incremental_update(manifest, filename)
 
 # Start a new GBIF batch job
-async def request_update_from_gbif(session, manifest):
-	print(f"IMPORT : Requesting latest occurrences from GBIF...")	
-	# Get timestamp for latest occurrence we know
-	timestamp = manifest.get('latest_download') or manifest.get('initial_download')
-	# Start putting together occurrence POST body
+async def request_update_from_gbif(session, manifest, initial=False):
+	# Log request mode
+	print(f"IMPORT : Requesting {'initial' if initial else 'latest'} occurrences from GBIF...")
+	# Build shared predicate base for both initial and incremental runs
+	predicates = [
+		{
+			"type": "not",
+			"predicate": {
+				"type": "equals",
+				"key": "HAS_GEOSPATIAL_ISSUE",
+				"value": True
+			}
+		},
+		{
+			"type": "in",
+			"key": "KINGDOM_KEY",
+			"values": [0, 5, 6]
+		},
+		{
+			"type": "equals",
+			"key": "HAS_COORDINATE",
+			"value": True
+		},
+		{
+			"type": "equals",
+			"key": "OCCURRENCE_STATUS",
+			"value": "PRESENT"
+		}
+	]
+	# Add MODIFIED cutoff only for incremental updates
+	if not initial:
+		# Get timestamp for latest occurrence we know
+		timestamp = manifest.get('latest_download') or manifest.get('initial_download')
+		# Skip incremental request when no baseline timestamp exists
+		if not timestamp:
+			print('IMPORT : No occurrence baseline timestamp in manifest, skipping incremental request')
+			return
+		# Prepend modified cutoff for incremental delta request
+		predicates.insert(0, {
+			"type": "greaterThan",
+			"key": "MODIFIED",
+			"value": timestamp[:10]
+		})
+	# Build request body
 	request_body = {
 		"creator": settings.GBIF_USER,
 		"sendNotification": False,
 		"format": "SIMPLE_PARQUET",
 		"predicate": {
 			"type": "and",
-			"predicates": [
-				{
-						"type": "greaterThan",
-						"key": "MODIFIED",
-						"value": timestamp[:10]
-					},
-					{
-					"type": "not",
-						"predicate": {
-							"type": "equals",
-							"key": "HAS_GEOSPATIAL_ISSUE",
-							"value": True
-						}
-					},
-					{
-						"type": "in",
-						"key": "KINGDOM_KEY",
-						"values": [ 5, 6 ]
-					},
-					{
-						"type": "equals",
-						"key": "HAS_COORDINATE",
-						"value": True
-					}
-				]
-			}
+			"predicates": predicates
 		}
-	# Send it off
+	}
+	# Send request to GBIF async download endpoint
 	async with session.post(GBIF_API_HOST + 'occurrence/download/request', json=request_body) as resp:
-		# Log errors
-		if resp.status != 201: 
-			print(f"IMPORT : { resp.status } error requesting latest GBIF occurrences: { await resp.text() }")
-			# Stop here
+		# Log and stop when GBIF rejects request creation
+		if resp.status != 201:
+			print(f"IMPORT : { resp.status } error requesting {'initial' if initial else 'latest'} GBIF occurrences: { await resp.text() }")
 			return
-		# Remember key
+		# Remember pending request key
 		current_download_key = await resp.text()
 		manifest['current_download_key'] = current_download_key
 		manifest['latest_download_request'] = datetime.now(timezone.utc).isoformat()
-		with open(os.path.join(GEO_DIR,'manifest.json'),'w') as f: json.dump(manifest, f, indent=4)
-		# Check response
-		print(f"IMPORT : Successfully requested dataset creation { current_download_key } with latest occurrences from GBIF")
+		save_manifest(manifest)
+		# Log success
+		print(f"IMPORT : Successfully requested dataset creation { current_download_key } with {'initial' if initial else 'latest'} occurrences from GBIF")
 
 # See if GBIF spawned a URL from which we eventually can download the data
 async def get_gbif_download_url(session,manifest):
@@ -223,9 +237,96 @@ async def get_gbif_download_url(session,manifest):
 					return
 		except Exception as e: print(f"IMPORT : Error trying to retrieve GBIF incremental update {pending_id}: {e}")
 		# Show progress
-		(f"IMPORT : Update not yet ready, trying again in 20 seconds...")
+		print(f"IMPORT : Update not yet ready, trying again in 20 seconds...")
 		# Wait 20 secs for next request
-		time.sleep(20)	
+		await asyncio.sleep(20)
+
+# Check zip integrity quickly before processing
+# Returns True when zip central directory can be read, False otherwise
+
+def is_valid_zip(path: str) -> bool:
+	# Sanity check file presence
+	if not os.path.isfile(path): return False
+	# Validate zip central directory
+	try:
+		with zipfile.ZipFile(path, 'r') as z: z.namelist()
+		return True
+	except Exception: return False
+
+# Wait for GBIF file readiness and download with aria
+# Returns True when file exists and is valid, False when still not ready/failed
+async def download_pending_occurrence_file(session, url, filename, manifest):
+	# Resolve local file path once
+	filepath = os.path.join(TMP_DIR, filename)
+	# Reuse previously downloaded file only if zip is valid
+	if is_valid_zip(filepath): return True
+	# Remove stale/corrupt partial zip before retrying download
+	if os.path.isfile(filepath): os.remove(filepath)
+	# Wait up to 20 minutes for remote file availability
+	for attempt in range(60):
+		# Probe download URL headers
+		async with session.head(url) as head_resp:
+			# Check if GBIF now serves a real file with length
+			if head_resp.status == 200:
+				content_length = head_resp.headers.get('Content-Length')
+				if content_length and int(content_length) > 1000: break
+		# Wait unless this was final retry
+		if attempt < 59:
+			print(f"IMPORT : File not ready, checking again in 20 seconds...")
+			await asyncio.sleep(20)
+	# Stop when file was never ready within wait window
+	else:
+		print(f"IMPORT : File still not ready after 20 minutes")
+		return False
+	# Wait for GBIF to report a stable file size before downloading
+	expected_size = 0
+	verify_after_delay = False
+	for size_check in range(30):
+		# Probe current content length
+		async with session.head(url) as size_resp:
+			# Read current file size from GBIF headers
+			if size_resp.status == 200 and size_resp.headers.get('Content-Length'):
+				current_size = int(size_resp.headers['Content-Length'])
+			else: current_size = 0
+		# Skip invalid/empty size responses
+		if current_size <= 1000:
+			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in 20 secs...")
+			await asyncio.sleep(20)
+			continue
+		# Confirm delayed verification check if we previously saw matching sizes
+		if verify_after_delay:
+			# Proceed only if size remained unchanged after the longer wait
+			if current_size == expected_size:
+				print(f"IMPORT : GBIF reports stable size {expected_size:,} bytes for {filename}")
+				break
+			# Reset verification state when size changed again
+			verify_after_delay = False
+			expected_size = current_size
+			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in 20 secs...")
+			await asyncio.sleep(20)
+			continue
+		# First matching check: pause briefly before final confirmation
+		if current_size == expected_size:
+			print(f"IMPORT : GBIF zip looks complete, waiting 20 secs to verify...")
+			verify_after_delay = True
+			await asyncio.sleep(20)
+			continue
+		# Track latest size and keep polling
+		expected_size = current_size
+		print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in 20 secs...")
+		await asyncio.sleep(20)
+	# Download the file via aria
+	success = await aria_download(filename, url, 4, TMP_DIR)
+	# Treat invalid/corrupt zip as unsuccessful download
+	if success and not is_valid_zip(filepath):
+		print('IMPORT : Download completed but zip validation failed, will retry later')
+		return False
+	# Persist latest successful download timestamp
+	if success:
+		manifest['latest_download'] = datetime.now(timezone.utc).isoformat()
+		save_manifest(manifest)
+	# Return download outcome
+	return bool(success)
 
 # Shared extraction: iterate parquet chunks in GBIF zip, filter plantae/fungi with valid coords
 # Produces temp occurrences table with (id, taxon, location, elevation, spatial_issue)

@@ -246,11 +246,15 @@ def create_col_area_lookup(db: duckdb.DuckDBPyConnection, target: str = 'col'):
 		-- normalize candidates: strip diacritics, punctuation, collapse whitespace
 		norm AS (
 			SELECT area_raw, candidate, ord,
-				lower(trim(regexp_replace(regexp_replace(regexp_replace(
-					translate(replace(lower(candidate), '&', ' and '), 'àáâãäåāăąçćčďèéêëēėęěìíîïīįıñńňòóôõöøōřśšùúûüūýÿžźż', 'aaaaaaaaacccdeeeeeeeeiiiiiiinnnooooooorssuuuuuyyzzz'),
-					'[\\.'''`]+', '', 'g'),
-					'[^a-z0-9]+', ' ', 'g'),
-					'\\s+', ' ', 'g'))) AS normalized
+				lower(trim(regexp_replace(regexp_replace(replace(
+					regexp_replace(
+						translate(replace(lower(candidate), '&', ' and '), 'àáâãäåāăąçćčďèéêëēėęěìíîïīįıñńňòóôõöøōřśšùúûüūýÿžźż', 'aaaaaaaaacccdeeeeeeeeiiiiiiinnnooooooorssuuuuuyyzzz'),
+						'[\\.`]+', '', 'g'
+					),
+					'''', ''
+				),
+				'[^a-z0-9]+', ' ', 'g'),
+				'\\s+', ' ', 'g'))) AS normalized
 			FROM candidates WHERE candidate IS NOT NULL AND len(trim(candidate)) > 0
 		),
 		-- join normalized candidates against WGSRPD lookup, keep best match per area_raw
