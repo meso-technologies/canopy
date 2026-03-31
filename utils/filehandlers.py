@@ -60,7 +60,9 @@ def get_latest_processed() -> dict | None:
 			'latest_processed': item, 
 			'timestamp_processed': item.split('.')[1]
 		}
-		# Parametric import of 'source' dict
+		# Skip pipeline outputs that live in processed dir but aren't source datasets
+		if dataset in ['geo']: continue
+		# Import dataset module to get citation metadata for release manifest
 		module = importlib.import_module(f"importer.canopy.datasets.{dataset}")
 		if module: 
 			# Also handle Tropicos edge cases where we have multiple sources

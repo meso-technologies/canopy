@@ -99,8 +99,11 @@ def build_habitat_maps(release: dict, db: duckdb.DuckDBPyConnection):
 	db.execute(f"""
 		CREATE TEMP TABLE habitat_points AS SELECT
 			taxon AS gbif_id,
-			-- Use envelope centroid reduced to ~100m precision for compact JSON payloads
-			ST_ReducePrecision(ST_Centroid(ST_Envelope_Agg(location)),0.001) as center_point,
+			-- Keep quadkey for rollup grouping in next stage
+			ST_QuadKey(location, 10) AS qk,
+			-- Union all points into multipoint then take centroid — avoids POINT EMPTY
+			-- that ST_Centroid(ST_Envelope_Agg(...)) produces on zero-area single-point tiles
+			ST_ReducePrecision(ST_Centroid(ST_Union_Agg(location)),0.001) as center_point,
 			COUNT(*) as count
 		-- QuadKey level 10 balances detail and payload size for client maps
 		FROM occurrences GROUP BY taxon, ST_QuadKey(location, 10);
@@ -109,6 +112,7 @@ def build_habitat_maps(release: dict, db: duckdb.DuckDBPyConnection):
 	print(f"IMPORT : Computed {db.execute("SELECT COUNT(*) FROM habitat_points").fetchone()[0]:,} unique habitat counts")
 	# Show sample habitat rows in verbose mode for debugging
 	if settings.VERBOSE: db.sql('SELECT * FROM habitat_points').show(max_rows=40)
+
 
 # Cluster each species' occurrence cloud into representative centroids
 def find_clusters(release: dict, db: duckdb.DuckDBPyConnection):

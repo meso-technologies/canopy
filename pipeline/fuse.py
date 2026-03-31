@@ -898,15 +898,16 @@ def decide_acceptance(results: dict, db: duckdb.DuckDBPyConnection):
 		# CoL is basically the Species Fungorum column missing in the Fungorum dataset 
 		'fungi': 	['col','inaturalist','gbif']
 	}
+	# Add pool and acceptance columns once before looping kingdoms
+	# Must be outside loop: DuckDB 1.5.1 resets existing values when ADD COLUMN IF NOT EXISTS has a DEFAULT clause
+	db.execute(f"""
+		ALTER TABLE meso ADD COLUMN IF NOT EXISTS accepted_by source_enum[];
+		ALTER TABLE meso ADD COLUMN IF NOT EXISTS accepted BOOLEAN DEFAULT FALSE;
+		ALTER TABLE meso ADD COLUMN IF NOT EXISTS considered_synonym source_enum[];
+		ALTER TABLE meso ADD COLUMN IF NOT EXISTS synonym BOOLEAN DEFAULT FALSE;
+	""")
 	# Handle kingdoms separately
-	for kingdom in ['plantae','fungi']:
-		# Add pool and acceptance columns
-		db.execute(f"""
-			ALTER TABLE meso ADD COLUMN IF NOT EXISTS accepted_by source_enum[];
-			ALTER TABLE meso ADD COLUMN IF NOT EXISTS accepted BOOLEAN DEFAULT FALSE;
-			ALTER TABLE meso ADD COLUMN IF NOT EXISTS considered_synonym source_enum[];
-			ALTER TABLE meso ADD COLUMN IF NOT EXISTS synonym BOOLEAN DEFAULT FALSE;
-		""")	
+	for kingdom in ['plantae','fungi']:	
 		# Add to pool
 		for authority in authorities[kingdom]: 
 			db.execute(f""" 

@@ -36,6 +36,8 @@ async def main(argv=None):
 	parser.add_argument('--fuse', action='store_true', help='Fuse latest processed data')
 	# Execute geospatial enrichment stage
 	parser.add_argument('--geo', action='store_true', help='Geospatial processing')
+	# Execute new polars-based geospatial pipeline (testing)
+	parser.add_argument('--geo-new', action='store_true', help='New polars-based geospatial processing')
 	# Execute API-backed enrichment stage (Wikipedia abstracts)
 	parser.add_argument('--apis', action='store_true', help='Update API-backed enrichment datasets like Wikipedia abstracts')
 	# Parse CLI args (or injected argv from wrapper)
@@ -57,7 +59,7 @@ async def main(argv=None):
 		# Collect per-source processing metadata for downstream fusion/diff
 		results = {}
 		# Run source stage when explicitly requested or when no later-only flags were provided
-		run_processing = args.process or args.download or not any([args.fuse, args.geo, args.apis])
+		run_processing = args.process or args.download or not any([args.fuse, args.geo, getattr(args, 'geo_new', False), args.apis])
 		# Start dataset execution stage when requested
 		if run_processing:
 			# Reuse one HTTP session across all dataset handlers
@@ -149,6 +151,25 @@ async def main(argv=None):
 				# Emit concise error summary for quick scanning
 				print(f'CANOPY : Error during geo: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
+				traceback.print_exception(type(e), e, e.__traceback__)
+		# Run new polars-based geo pipeline when requested
+		if getattr(args, 'geo_new', False):
+			try:
+				# Import new geo pipeline
+				from .pipeline.geo_new import load_occurrences, rollup_to_parents, build_habitat_maps
+				# Fall back to latest release if none provided
+				if not release:
+					from .utils.filehandlers import get_latest_release
+					release = get_latest_release()
+				# Run the polars pipeline
+				compact = load_occurrences(release)
+				compact = rollup_to_parents(compact, release)
+				habitat = build_habitat_maps(compact)
+				# Log result summary
+				print(f"IMPORT : New geo pipeline complete: {len(habitat):,} habitat tiles across {habitat['gbif_id'].n_unique():,} taxa")
+			except Exception as e:
+				had_errors = True
+				print(f'CANOPY : Error during geo-new: {type(e).__name__}: {str(e)}')
 				traceback.print_exception(type(e), e, e.__traceback__)
 		# Run API enrichment stage only when requested
 		if args.apis:
