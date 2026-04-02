@@ -74,6 +74,8 @@ def process_wikidata(source: Dict):
 	if not os.path.isfile(os.path.join(TMP_DIR,filtered)): filtered = filter_gzip(source, "|".join([f'"{prop}"' for prop in RIPGREP_FILTERS]))
 	# Process with DuckDB
 	with duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Update settings
 		db.execute(f"""
 			SET threads = { int(get_system_resources()[0] - 1) };

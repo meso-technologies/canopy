@@ -396,6 +396,14 @@ def process_incremental_update(manifest,filename):
 			""")	
 			count = db.execute("SELECT COUNT(*) FROM existing_occurrences").fetchone()[0]
 			print(f"IMPORT : Loaded {count:,} occurrences from existing {os.path.join(GEO_DIR,'occurrences.parquet')}")
+			# Count incoming rows that match existing occurrence ids
+			updated_count = db.execute("""
+				SELECT COUNT(*)
+				FROM occurrences AS source
+				WHERE EXISTS (
+					SELECT 1 FROM existing_occurrences AS target WHERE target.id = source.id
+				);
+			""").fetchone()[0]
 			# Upsert: update changed occurrences, then insert new ones
 			db.execute("""
 				UPDATE existing_occurrences
@@ -403,7 +411,8 @@ def process_incremental_update(manifest,filename):
 					elevation = occurrences.elevation, spatial_issue = occurrences.spatial_issue
 				FROM occurrences WHERE existing_occurrences.id = occurrences.id;
 			""")
-			print(f"IMPORT : Updated existing occurrence data")
+			# Log how many incoming occurrences mapped to existing ids
+			print(f"IMPORT : Updated {updated_count:,} existing occurrences")
 			# Insert occurrences not already in existing set
 			db.execute("""
 				INSERT INTO existing_occurrences SELECT * FROM occurrences AS source

@@ -8,7 +8,7 @@
 # TODO: https://www.iucnredlist.org/species/120941671/120980128
 
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import zipfile
@@ -38,6 +38,8 @@ def process_iucn(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv file
 		taxa_csv = db.read_csv(zip.open('taxon.txt'), parallel=True, header=False, delimiter="\t", names=[
 			'id','scientificName', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'specificEpithet', 'scientificNameAuthorship', 

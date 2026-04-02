@@ -13,7 +13,7 @@
 #		TODO: Import tropicosId properly, check tplID usage
 #
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import zipfile
@@ -45,6 +45,8 @@ def process_wfo(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv files
 		taxa_csv = db.read_csv(zip.open('classification.csv'),parallel=True, ignore_errors=True)
 		reference_csv = db.read_csv(zip.open('references.csv'),parallel=True)

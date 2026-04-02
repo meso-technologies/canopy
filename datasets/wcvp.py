@@ -21,7 +21,7 @@
 #		TODO: Extract full lifeform_description and climate_description beyond boolean flags
 #
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import zipfile
@@ -52,6 +52,8 @@ def process_wcvp(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv files
 		name_csv = db.read_csv(zip.open('wcvp_names.csv'),parallel=True,delimiter="|")
 		distribution_csv = db.read_csv(zip.open('wcvp_distribution.csv'),parallel=True,delimiter="|")

@@ -21,7 +21,7 @@ source = {
 }
 
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import zipfile
@@ -43,6 +43,8 @@ async def update_gbif(session):
 def process_gbif(source: dict):
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv files
 		taxa_tsv = db.read_csv(zip.open('Taxon.tsv'),parallel=True,ignore_errors=True)
 		distribution_tsv = db.read_csv(zip.open('Distribution.tsv'),parallel=True,ignore_errors=True)

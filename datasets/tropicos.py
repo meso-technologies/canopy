@@ -13,7 +13,7 @@
 #		TODO: Extract typeStatus from occurrence data
 #
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # Get latest version
 import aiohttp
@@ -68,6 +68,8 @@ def process_tropicos(sources: dict):
 	print(f"IMPORT : Starting to process { sources[0]['latest_download'] } and { sources[1]['latest_download'] }...")  
 	# Load duckdb
 	with duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Open zips seperately, the tow datasets are either plants at Missouri University or external sources (Non-MO)
 		specimen = zipfile.ZipFile(f"{SRC_DIR}/{sources[0]['latest_download']}")
 		nonmo = zipfile.ZipFile(f"{SRC_DIR}/{sources[1]['latest_download']}")

@@ -2,13 +2,13 @@
 # 		Wikipedia GraphQL clients
 #
 import os, requests, time
-from .. import settings, API_DATA_DIR, RELEASES_DIR
+from .. import settings, API_DATA_DIR, RELEASES_DIR, TMP_DIR
 from ..utils.filehandlers import get_latest_release, get_file
 # Data processing
 import duckdb, pyarrow
 
 def update_wikipedia(release=None):
-	print(f"IMPORT : ############### Updating local copy of Wikipedia data ###############")
+	print(f"IMPORT : Updating local copy of Wikipedia data")
 	# If we jumped directly here and have no release, grab the latest to look up wikidata Q identifiers
 	if not release: 
 		release = get_latest_release(RELEASES_DIR)
@@ -18,6 +18,8 @@ def update_wikipedia(release=None):
 		else: print(f"IMPORT : No release provided, falling back on latest staging release {release['version']}")	
 	# Spawn db
 	with duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Check if we have any wikipedia abstracts at all
 		if not os.path.isfile(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet")): 
 			print(f"IMPORT : No Wikipedia abstracts found, building dataset from scratch")

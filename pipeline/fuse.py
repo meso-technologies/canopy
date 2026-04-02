@@ -16,7 +16,7 @@
 import os, shutil
 
 # Settings
-from .. import PROCESSED_DIR, RELEASES_DIR, settings
+from .. import PROCESSED_DIR, RELEASES_DIR, TMP_DIR, settings
 from ..utils.filehandlers import check_release, get_latest_processed
 from ..utils.queries import write_to_disc
 # DB
@@ -63,6 +63,8 @@ def fuse(results):
 		results = get_latest_processed()
 	# Keep one in-memory DuckDB connection for full fusion flow
 	with duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# MAP phase: maximize name coverage and cross-source identifier linking
 		print(f"IMPORT : ############### Building Initial Name Index ###############")
 		# Load data

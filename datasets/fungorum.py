@@ -46,6 +46,8 @@ def process_fungorum(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv files
 		name_tsv = db.read_csv(zip.open('Name.tsv'),parallel=True)
 		# "col:ID" is always equal to "col:nameID"

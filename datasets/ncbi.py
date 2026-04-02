@@ -4,7 +4,7 @@
 #
 #		Highlights: Used to look up proteins
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import zipfile
@@ -34,6 +34,8 @@ def process_ncbi(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial csv file
 		taxa_csv = db.read_csv(zip.open('taxa.txt'), parallel=True, header=False, delimiter="\t", names=['id', 'parent', 'synonym', 'rank', 'scientificName', 'comment'])
 		# Createinitial

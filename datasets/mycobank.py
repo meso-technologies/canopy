@@ -36,6 +36,8 @@ async def update_mycobank(session):
 def process_mycobank(source: dict):
 	# Load zipfile and duckdb
 	with duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Extract the single ... *checks notes* ... Excel file
 		zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}").extractall(TMP_DIR) 
 		print(f"IMPORT : Unzipped Mycobank xlsx to {TMP_DIR}")

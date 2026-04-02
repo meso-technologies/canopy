@@ -9,7 +9,7 @@
 # TODO: Get more external IDs out of references column
 
 # Settings 
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 from ..utils.filehandlers import fetch
@@ -44,6 +44,8 @@ def process_inaturalist(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial csv file, turning off strict as the 'references' field has a bunch of errors (URLs with commas, quotes etc)
 		taxa_csv = db.read_csv(zip.open('taxa.csv'), parallel=False, strict_mode=False)
 		# Create merged table by selecting all fields we're interested and create placeholders for further data

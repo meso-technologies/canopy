@@ -24,7 +24,7 @@ source = {
 }
 
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import os, re, unicodedata, zipfile
@@ -49,6 +49,8 @@ async def update_col(session):
 def process_col(source: dict):
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load TSVs — quotechar='\0' disables quoting (CoL fields contain unescaped quotes)
 		name_tsv = db.read_csv(zip.open('NameUsage.tsv'),parallel=True,null_padding=True, delimiter='\t', quotechar='\0')
 		vernacular_tsv = db.read_csv(zip.open('VernacularName.tsv'),parallel=True,null_padding=True, delimiter='\t', quotechar='\0')

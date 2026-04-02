@@ -12,7 +12,7 @@
 #		TODO: Extract full lifeform/climate from dynamicProperties beyond boolean annual/perennial
 #
 # Internal
-from .. import SRC_DIR, settings
+from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import zipfile
@@ -43,6 +43,8 @@ def process_powo(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
 	# Load zipfile and duckdb
 	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv files
 		taxa_tsv = db.read_csv(zip.open('taxon.txt'), parallel=True, header=False, quotechar='', delimiter="\t", names=['taxonID', 
 			'modified', 'verbatimTaxonRank', 'scientificName', 'family', 'genus', 'specificEpithet', 'infraspecificEpithet', 
