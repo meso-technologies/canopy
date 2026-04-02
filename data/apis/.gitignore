@@ -1,0 +1,3 @@
+# Keep directory structure in git while ignoring API enrichment artifacts
+*
+!.gitignore

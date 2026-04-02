@@ -14,9 +14,6 @@ releases/**
 geo/**
 apis/**
 
-# Ignore per-subdirectory placeholder gitignores generated locally
-*/.gitignore
-
 # Keep geo attribute policy tracked for binary raster side files
 !geo/.gitattributes
 

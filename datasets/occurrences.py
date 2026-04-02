@@ -23,6 +23,10 @@ from aiohttp import BasicAuth
 user_agent = 'Meso Plant Database/1.0 (bruno@meso.cloud)'
 # URL settings
 GBIF_API_HOST = 'https://api.gbif.org/v1/'
+# Seconds between pending-file readiness probes
+GBIF_RETRY_SECONDS = 20
+# Maximum number of pending-file readiness probes before giving up this run
+GBIF_FILE_READY_ATTEMPTS = 60
 
 # Main function 
 async def update_occurrences():
@@ -237,9 +241,9 @@ async def get_gbif_download_url(session,manifest):
 					return
 		except Exception as e: print(f"IMPORT : Error trying to retrieve GBIF incremental update {pending_id}: {e}")
 		# Show progress
-		print(f"IMPORT : Update not yet ready, trying again in 20 seconds...")
-		# Wait 20 secs for next request
-		await asyncio.sleep(20)
+		print(f"IMPORT : Update not yet ready, trying again in {GBIF_RETRY_SECONDS} seconds...")
+		# Wait before next request
+		await asyncio.sleep(GBIF_RETRY_SECONDS)
 
 # Check zip integrity quickly before processing
 # Returns True when zip central directory can be read, False otherwise
@@ -262,8 +266,8 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 	if is_valid_zip(filepath): return True
 	# Remove stale/corrupt partial zip before retrying download
 	if os.path.isfile(filepath): os.remove(filepath)
-	# Wait up to 20 minutes for remote file availability
-	for attempt in range(60):
+	# Wait for remote file availability
+	for attempt in range(GBIF_FILE_READY_ATTEMPTS):
 		# Probe download URL headers
 		async with session.head(url) as head_resp:
 			# Check if GBIF now serves a real file with length
@@ -271,9 +275,9 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 				content_length = head_resp.headers.get('Content-Length')
 				if content_length and int(content_length) > 1000: break
 		# Wait unless this was final retry
-		if attempt < 59:
-			print(f"IMPORT : File not ready, checking again in 20 seconds...")
-			await asyncio.sleep(20)
+		if attempt < (GBIF_FILE_READY_ATTEMPTS - 1):
+			print(f"IMPORT : File not ready, checking again in {GBIF_RETRY_SECONDS} seconds...")
+			await asyncio.sleep(GBIF_RETRY_SECONDS)
 	# Stop when file was never ready within wait window
 	else:
 		print(f"IMPORT : File still not ready after 20 minutes")
@@ -290,8 +294,8 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 			else: current_size = 0
 		# Skip invalid/empty size responses
 		if current_size <= 1000:
-			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in 20 secs...")
-			await asyncio.sleep(20)
+			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
+			await asyncio.sleep(GBIF_RETRY_SECONDS)
 			continue
 		# Confirm delayed verification check if we previously saw matching sizes
 		if verify_after_delay:
@@ -302,19 +306,19 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 			# Reset verification state when size changed again
 			verify_after_delay = False
 			expected_size = current_size
-			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in 20 secs...")
-			await asyncio.sleep(20)
+			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
+			await asyncio.sleep(GBIF_RETRY_SECONDS)
 			continue
 		# First matching check: pause briefly before final confirmation
 		if current_size == expected_size:
-			print(f"IMPORT : GBIF zip looks complete, waiting 20 secs to verify...")
+			print(f"IMPORT : GBIF zip looks complete, waiting {GBIF_RETRY_SECONDS} secs to verify...")
 			verify_after_delay = True
-			await asyncio.sleep(20)
+			await asyncio.sleep(GBIF_RETRY_SECONDS)
 			continue
 		# Track latest size and keep polling
 		expected_size = current_size
-		print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in 20 secs...")
-		await asyncio.sleep(20)
+		print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
+		await asyncio.sleep(GBIF_RETRY_SECONDS)
 	# Download the file via aria
 	success = await aria_download(filename, url, 4, TMP_DIR)
 	# Treat invalid/corrupt zip as unsuccessful download

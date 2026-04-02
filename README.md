@@ -1,24 +1,13 @@
 # Canopy
 
-Standalone taxonomy pipeline extracted from Meso importer.
+Canopy builds a unified taxonomy release from multiple botanical and mycological authorities. It keeps source provenance visible, reconciles differences in acceptance and classification, and produces practical outputs for search, hierarchy browsing, and geospatial enrichment.
 
-## Setup
-
-```bash
-cd data/importer/canopy
-bash ./setup.sh
-```
-
-## Update
+## Run Examples
 
 ```bash
-cd data/importer/canopy
-bash ./update.sh
-```
+# Simple full run
+uv run python -m importer.canopy.run 
 
-## Run
-
-```bash
 # Download only
 uv run python -m importer.canopy.run --download
 
@@ -29,7 +18,19 @@ uv run python -m importer.canopy.run --process --fuse --geo --apis
 uv run python -m importer.canopy.run --debug --process --fuse
 ```
 
-## Secrets
+## Flags
 
-Copy `config/secrets.py.template` to `config/secrets.py` and fill credentials.
-Missing credentials are handled gracefully (GBIF updates are skipped).
+- `-d`, `--dataset` — limit source processing to one dataset (`ipni`, `fungorum`, `wcvp`, `powo`, `wfo`, `col`, `tropicos`, `mycobank`, `bhl`, `gbif`, `wikidata`, `wikispecies`, `inaturalist`, `iucn`, `ncbi`)
+- `-v`, `--verbose` — show richer stage diagnostics
+- `-f`, `--force` — recompute even when outputs already exist
+- `--csv` — write CSV sidecars in addition to parquet
+- `--debug` — reduced workload profile for local iteration
+- `--download` — download source datasets only
+- `--process` — process source datasets
+- `--fuse` — build fused release output
+- `--geo` — compute geospatial artifact
+- `--apis` — run API-backed enrichment (Wikipedia abstracts etc)
+
+## Setup & Secrets
+
+Run `./setup.sh` once and `./update.sh` occasionally. Copy `config/secrets.py.template` to `config/secrets.py` and fill credentials before running. Missing credentials are handled gracefully (GBIF updates are skipped).

@@ -1,0 +1,4 @@
+# Keep directory structure in git while ignoring geo runtime artifacts
+*
+!.gitignore
+!.gitattributes

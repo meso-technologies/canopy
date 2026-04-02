@@ -1,0 +1,3 @@
+# Keep directory structure in git while ignoring processed artifacts
+*
+!.gitignore

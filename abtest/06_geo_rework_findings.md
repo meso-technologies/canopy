@@ -111,6 +111,8 @@ Keep for posterity:
 
 - This summary file: `06_geo_rework_findings.md`
 - Consolidated executable benchmark: `07_geo_centroid_bench.py`
+- Rollup and habitat benchmark: `08_rollup_habitat_abtest.py`
+- Packaging profiler benchmark: `09_packaging_profile.py`
 
 Remove superseded one off scripts from this session:
 
@@ -118,6 +120,59 @@ Remove superseded one off scripts from this session:
 - `06_assumption_bench_isolated.py`
 - `08_centroid_speed_experiments.py`
 - `09_dedupe_equivalence.py`
+- `11_packaging_abtest.py`
++
++## Additional learnings from follow-up tests (08 to 09)
++
++### 6) Packaging hotspot root cause (09)
++
++Measured with real dump inputs:
++
++- habitat rows: ~70,224,662
++- habitat taxa: ~443,972
++- centroids: ~443,972
++- elevation bins: ~3,066,068
++
++Observed timing pattern:
++
++- The dominant cost is habitat aggregation:
++  - `array_agg(struct_pack(... ) ORDER BY ...) GROUP BY gbif_id`
++- Centroid clean/profile clean/update steps are comparatively small.
++
++Decision:
++
++- Treat habitat aggregation as the primary optimization and memory-risk target.
++
++### 7) Packaging variant outcomes (09)
++
++Compared:
++
++- A: current create + alter + updates shape
++- C: pre-aggregate and single CTAS join
++- D: staged table flavor of join path
++
++Observed on full runs:
++
++- A was fastest in this workload.
++- C was significantly slower.
++- D was better than C but still slower than A.
++
++Decision:
++
++- Keep A semantics for speed.
++- Improve reliability via memory lifecycle and partitioning, not by switching to C.
++
++### 8) Dead ends and anti-patterns to avoid
++
++- Broad `json_each` reconstruction from final geo JSON for large A/B prep caused heavy spill storms and unstable runs.
++- Long inline benchmark commands without durable per-step logging made failures harder to interpret.
++- Wrapper launches with `uv --no-sync` fail when canopy env is newly created or incompatible; run `uv sync --project importer/canopy` first.
++
++### 9) What worked reliably
++
++- Durable step logging benchmark (`09_packaging_profile.py`) with partition mode for fast hotspot detection.
++- Spooling stage payloads to parquet before high-pressure phases.
++- Running canopy with a healthy synced project env restored normal startup behavior.
 
 ## Operational guidance
 
