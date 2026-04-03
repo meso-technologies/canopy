@@ -316,8 +316,16 @@ class S3Storage:
 	def read_json(self, path):
 		# Resolve object key from path-like input
 		key = self._resolve_key(path)
-		# Fetch object payload from S3
-		response = self.s3.get_object(Bucket=self.bucket, Key=key)
+		try:
+			# Fetch object payload from S3
+			response = self.s3.get_object(Bucket=self.bucket, Key=key)
+		except self.client_error as err:
+			# Map missing-object responses to FileNotFoundError for storage parity
+			if err.response.get('ResponseMetadata', {}).get('HTTPStatusCode') == 404: raise FileNotFoundError(path)
+			# Map S3 NoSuchKey/NotFound style codes to FileNotFoundError
+			if err.response.get('Error', {}).get('Code') in ['404', 'NoSuchKey', 'NotFound']: raise FileNotFoundError(path)
+			# Re-raise unexpected API errors
+			raise
 		# Decode JSON payload bytes as UTF-8
 		payload = response['Body'].read().decode('utf-8')
 		# Return parsed JSON data
