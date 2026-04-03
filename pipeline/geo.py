@@ -483,26 +483,19 @@ def medians_from_elevation_bins(all_bins: pl.DataFrame) -> pl.DataFrame:
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Register profile bins in DuckDB
 		db.register('elevation_bins_df', all_bins.to_arrow())
-		# Compute median bins using cumulative counts
+		# Compute weighted median elevation from binned occurrence counts per taxon
 		result = db.execute("""
 			WITH ordered AS (
-				SELECT
-					gbif_id,
-					elevation_bin,
-					bin_count,
-					sum(bin_count) OVER (PARTITION BY gbif_id ORDER BY elevation_bin ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_count,
+				-- Running cumulative count per taxon, bins ascending by elevation
+				SELECT gbif_id, elevation_bin, bin_count,
+					sum(bin_count) OVER (PARTITION BY gbif_id ORDER BY elevation_bin) AS cum_count,
 					sum(bin_count) OVER (PARTITION BY gbif_id) AS total_count
-				FROM elevation_bins_df
-			),
-			picked AS (
-				SELECT
-					gbif_id,
-					min(elevation_bin) FILTER (WHERE cum_count >= (total_count + 1) / 2.0) AS elevation
-				FROM ordered
-				GROUP BY gbif_id
+				-- Exclude NULL bins — higher-rank rollups accumulate millions of unknown-elevation occurrences that would prevent any real bin from reaching the median threshold
+				FROM elevation_bins_df WHERE elevation_bin IS NOT NULL
 			)
-			SELECT gbif_id, cast(elevation AS INTEGER) AS elevation
-			FROM picked;
+			-- First bin whose cumulative count crosses the 50th percentile
+			SELECT gbif_id, cast(min(elevation_bin) FILTER (WHERE cum_count >= (total_count + 1) / 2.0) AS INTEGER) AS elevation
+			FROM ordered GROUP BY gbif_id;
 		""").pl()
 	# Return derived higher-rank medians
 	return result
@@ -881,9 +874,10 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 					WITH habitat_part AS (
 						SELECT
 							gbif_id,
+							-- Sort dense tiles first so sparse ones don't obscure them on map render, 20 chosen as visual sweet spot across species with varying tile counts
 							array_agg(
 								struct_pack(lng := center_lng, lat := center_lat, occ := count)
-								ORDER BY CASE WHEN count = 1 THEN 1 ELSE 0 END, count DESC
+								ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC
 							)::JSON AS habitat,
 							max(count) AS max,
 							avg(count) AS avg

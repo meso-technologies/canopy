@@ -7,6 +7,8 @@ from .. import PROCESSED_DIR, SRC_DIR, TMP_DIR, RELEASES_DIR, settings
 from ..utils.downloader import pull, get_local_source_file
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
+# Load run-state helper to persist latest source download/process metadata
+from ..utils.state import update_source_state
 
 # Track wrapper-distilled release artifact prefixes for cleanup logic
 releasefiles = ['precog','typesense','postgres','taxonext','citations','timeline','rarities']
@@ -42,6 +44,8 @@ async def fetch(session, source: dict) -> bool:
 	# Check if we even have something to process at this point
 	# Use explicit None check so legacy datehash 0 files still count as available local sources
 	if source.get('timestamp_download') is None: return False
+	# Persist latest known source metadata into shared state manifest
+	update_source_state(source, 'fetch')
 	# Check if we need to process
 	if not source.get('timestamp_processed') or (source.get('timestamp_download') and source.get('timestamp_processed') < source.get('timestamp_download')):
 		print(f"IMPORT : Processed { source['name']} version outdated, we have { source.get('timestamp_processed') } but { source.get('timestamp_download') } is available.")

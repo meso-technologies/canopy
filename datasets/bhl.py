@@ -16,6 +16,8 @@ from .. import SRC_DIR, TMP_DIR, settings
 import gzip, os, ssl, zipfile
 import aiohttp
 from ..utils.filehandlers import get_file
+# Load run-state helper to persist latest manual BHL download/process metadata
+from ..utils.state import update_source_state
 from ..utils.downloader import get_local_source_file, get_timestamp_remote
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
@@ -137,6 +139,8 @@ async def update_bhl(session):
 	need_process = source.get('timestamp_download', 0) > timestamp_processed
 	# Run processor if we have new data or force flag is set
 	if (need_process or settings.FORCE) and source.get('latest_download') and not settings.DOWNLOAD_ONLY: process_bhl(source)
+	# Persist latest BHL source metadata in shared state manifest
+	update_source_state(source, 'fetch')
 	# Return the source dict containing processing outcomes
 	return source
     

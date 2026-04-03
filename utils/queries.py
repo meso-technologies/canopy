@@ -8,6 +8,8 @@ import duckdb
 from .. import settings, PROCESSED_DIR
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
+# Load run-state helper to persist latest processed output metadata
+from ..utils.state import update_source_state
 
 # Filters most of the series, pages, year etc out of publications:
 publication_filter = "'^(.*?)(?:\\s+\\d+(?:\\s*\\([^)]*\\))?(?:\\s*:|$))'"
@@ -258,6 +260,11 @@ def write_to_disc(db: duckdb.DuckDBPyConnection, source: dict, dir = PROCESSED_D
 	if source['name'] != 'meso':
 		# Update latest processed once we wrote it to disc
 		source['latest_processed'] = filename + '.parquet'
+		# Parse and store processed timestamp when filename uses source.YYYYMMDD pattern
+		try: source['timestamp_processed'] = int(filename.split('.')[1])
+		except (ValueError, IndexError): pass
+		# Persist latest processed metadata in shared state manifest
+		update_source_state(source, 'process')
 		# Delete older processed files
 		delete_older_files(filename.split('.')[0],filename.split('.')[1],PROCESSED_DIR)
 

@@ -12,6 +12,8 @@ import aiohttp
 from . import settings, build_settings
 # Load storage proxy for startup backend status logging
 from .utils.s3 import storage
+# Load state checkpoint helper for minimal stage-completion timestamps
+from .utils.state import set_checkpoint
 
 # Define source execution order so fusion gets expected dependencies
 sources = ['ipni', 'fungorum', 'wcvp', 'powo', 'wfo', 'col', 'tropicos', 'mycobank', 'bhl', 'gbif', 'wikidata', 'wikispecies', 'inaturalist', 'iucn', 'ncbi']
@@ -116,6 +118,8 @@ async def main(argv=None):
 						traceback.print_exception(type(e), e, e.__traceback__)
 		# Exit after downloads when explicitly running download-only mode
 		if runtime.DOWNLOAD_ONLY:
+			# Mark authoritative download checkpoint only for full-source runs
+			if not args.dataset: set_checkpoint('download')
 			# Explain why follow-up stages are skipped
 			print('CANOPY : Download-only run complete, skipping process/fuse/geo/apis steps')
 			# No release object is produced in download-only runs

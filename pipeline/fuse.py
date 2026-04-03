@@ -21,6 +21,8 @@ from ..utils.filehandlers import check_release, get_latest_processed
 from ..utils.queries import write_to_disc
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
+# Load shared state manifest reader for release-manifest source metadata merge
+from ..utils.state import load_state
 # DB
 import duckdb
 # UDFs
@@ -1278,8 +1280,24 @@ def package_release(results: dict, db: duckdb.DuckDBPyConnection):
 		target_file = os.path.join(release_dir, results[result].get('latest_processed'))
 		print(f"IMPORT : Copying { processed_file } to { target_file }")
 		storage.copy(processed_file, target_file)
+	# Load latest run-state manifest for source metadata enrichment
+	state_manifest = load_state()
+	# Build merged source payload with state values and runtime fallback values
+	release_sources = {}
+	# Merge each source used in this release
+	for source_name, source_payload in results.items():
+		# Start from runtime payload so existing flow still works if state is missing
+		merged = dict(source_payload)
+		# Pull matching source entry from state manifest when available
+		state_source = state_manifest.get('sources', {}).get(source_name, {})
+		# Overlay stable source metadata from state when present
+		for key in ['url', 'citation', 'latest_download', 'timestamp_download', 'timestamp_remote', 'timestamp_local', 'latest_processed', 'timestamp_processed']:
+			# Keep state value only when it is explicitly available
+			if state_source.get(key) is not None: merged[key] = state_source.get(key)
+		# Store merged source payload under canonical source name
+		release_sources[source_name] = merged
 	# Create manifest
-	manifest = { 'version': release, 'sources': results}
+	manifest = { 'version': release, 'sources': release_sources}
 	# Write manifest to disc
 	storage.write_json(os.path.join(release_dir,'manifest.json'), manifest)
 	# Return data for next step	
