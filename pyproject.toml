@@ -18,6 +18,7 @@ dependencies = [
 	"faiss-cpu",
 	"psutil",
 	"requests",
+	"boto3",
 	"fsspec",
 	"pandas"
 ]

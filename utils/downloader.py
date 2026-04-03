@@ -9,6 +9,8 @@ from pathlib import PurePath
 
 # Load canopy source directory constant
 from .. import SRC_DIR
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 
 # Compare remote/local timestamps and download newer source file when needed
 async def pull(session: aiohttp.ClientSession, source: dict) -> bool:
@@ -67,10 +69,26 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 		target_path = f"{ SRC_DIR }/{ target_file }"
 		# Route to aria2 for sources configured with multi-connection downloads
 		if 'use_aria' in source and isinstance(source['use_aria'], int):
+			# Stream large throttled Wikidata archive directly to S3 when S3 backend is active
+			if storage.is_s3() and source.get('name') == 'wikidata':
+				# Build destination key under source prefix
+				target_key = f"source/{target_file}"
+				# Stream HTTP response into multipart S3 upload
+				await storage.stream_to_s3(url, target_key, session)
+				# Delete older source versions after successful streamed upload
+				delete_older_files(filename, datehash, SRC_DIR)
+				# Store downloaded timestamp for downstream processing checks
+				source['timestamp_download'] = datehash
+				# Store downloaded filename for downstream processing paths
+				source['latest_download'] = target_file
+				# Return synthetic HTTP-like success status for streamed path
+				return 200
 			# Execute aria2 download with configured connection count
 			success = await aria_download(target_file, url, source['use_aria'])
 			# Abort when aria2 download failed
 			if not success: return None
+			# Upload completed local file to S3 when S3 backend is active
+			if storage.is_s3(): storage.upload(target_path, f"source/{target_file}")
 			# Keep placeholder branch for future aria-specific timestamp extraction
 			if not datehash:
 				# No-op for now because datehash is expected from remote timestamp lookup
@@ -99,6 +117,8 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 					print(f"IMPORT : Writing { target_file }")
 					# Persist payload to local source file
 					await file.write(data)
+					# Upload completed local file to S3 when S3 backend is active
+					if storage.is_s3(): storage.upload(target_path, f"source/{target_file}")
 					# Remove older local files after successful write
 					delete_older_files(filename, datehash, SRC_DIR)
 					# Store downloaded timestamp for downstream processing checks
@@ -126,6 +146,14 @@ async def aria_ready(source: dict, dir: str | None = None) -> bool:
 		return False
 	# Build expected file path
 	file_path = os.path.join(dir, source['latest_download'])
+	# Handle S3-backed artifacts via object existence and size checks
+	if storage.is_s3():
+		# Return false when remote source object is missing
+		if not storage.exists(file_path): return False
+		# Return false when remote source object is empty
+		if storage.size(file_path) == 0: return False
+		# Return true when remote source object exists with non-zero size
+		return True
 	# Build aria sidecar path used to track partial download state
 	sidecar_path = file_path + '.aria2'
 	# Resume download when aria sidecar indicates partial state
@@ -221,20 +249,24 @@ def get_local_source_file(starts_with: str) -> str | None:
 	most_recent = None
 	# Track filename matching most recent timestamp
 	latest_file = None
-	# Iterate all files in source directory
-	for file in os.listdir(SRC_DIR):
-		# Build full path for size and file-type checks
+	# Iterate all files in source backend directory
+	for file in storage.list_files(SRC_DIR, prefix=starts_with + '.'):
+		# Build full path for size checks and cleanup
 		file_path = os.path.join(SRC_DIR, file)
-		# Process only regular files that match expected dataset prefix
-		if os.path.isfile(file_path) and file.startswith(starts_with + '.'):
-			# Remove zero-byte leftovers from interrupted downloads
-			if os.path.getsize(file_path) == 0:
-				# Log and delete empty file so it cannot poison timestamp selection
-				print(f"IMPORT : {file_path} has 0 bytes, ignoring and deleting")
-				# Delete empty file artifact
-				os.remove(file_path)
-				# Continue scanning other candidate files
-				continue
+		# Process only files that match expected dataset prefix
+		if file.startswith(starts_with + '.'):
+			# Skip zero-byte cleanup for S3-backed listings
+			if storage.is_s3() and storage.size(file_path) == 0: continue
+			# Process local zero-byte cleanup when using filesystem backend
+			if not storage.is_s3() and os.path.isfile(file_path):
+				# Remove zero-byte leftovers from interrupted downloads
+				if os.path.getsize(file_path) == 0:
+					# Log and delete empty file so it cannot poison timestamp selection
+					print(f"IMPORT : {file_path} has 0 bytes, ignoring and deleting")
+					# Delete empty file artifact
+					os.remove(file_path)
+					# Continue scanning other candidate files
+					continue
 			# Parse timestamp segment from dataset filename convention
 			timestamp = file.split('.')[1]
 			# Seed latest-file tracking on first valid candidate

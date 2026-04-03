@@ -13,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 # Internal
 from .. import TMP_DIR, GEO_DIR, settings
 from ..utils.downloader import aria_download
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 # File handling & DB
 import duckdb
 import zipfile
@@ -32,10 +34,12 @@ GBIF_FILE_READY_ATTEMPTS = 60
 async def update_occurrences():
 	# Resolve path to rolling occurrence parquet
 	file = os.path.join(GEO_DIR, f"occurrences.parquet")
+	# Ensure local rolling parquet exists when canonical copy is stored in S3
+	if storage.is_s3() and storage.exists(file) and not os.path.isfile(file): storage.ensure_local(file, GEO_DIR)
 	# Skip GBIF API update when credentials are missing
 	if not settings.GBIF_USER or not settings.GBIF_PASSWORD:
 		# Soft-skip when we already have a local occurrence baseline
-		if os.path.isfile(file):
+		if storage.exists(file):
 			print('IMPORT : GBIF credentials missing, skipping occurrence update and reusing local occurrences.parquet')
 			return
 		# Hard-stop bootstrap when there is no local baseline at all
@@ -43,7 +47,7 @@ async def update_occurrences():
 		print('IMPORT : Register credentials at https://www.gbif.org/user/profile and set them in canopy/secrets.py')
 		raise RuntimeError('No local GBIF occurrences.parquet and no GBIF credentials available')
 	# Bootstrap when no processed occurrence parquet exists yet
-	if not os.path.isfile(file):
+	if not storage.exists(file):
 		# Log bootstrap path
 		print(f"IMPORT : No processed GBIF occurrence dataset found")
 		# Reuse already downloaded bootstrap zip only when it is valid
@@ -104,7 +108,7 @@ async def update_occurrences():
 
 def save_manifest(manifest: dict):
 	# Write manifest atomically from in-memory dict
-	with open(os.path.join(GEO_DIR,'manifest.json'),'w') as f: json.dump(manifest, f, indent=4)
+	storage.write_json(os.path.join(GEO_DIR,'manifest.json'), manifest)
 
 # Kick off and wait for an occurrence update
 async def get_latest_occurrences(file):
@@ -392,7 +396,9 @@ def process_incremental_update(manifest,filename):
 		else:
 			db.execute(f"SET temp_directory = '{ TMP_DIR }'")
 			# Load existing geoparquet into DuckDB for merge
-			existing_occurrence_parquet = db.read_parquet(os.path.join(GEO_DIR,'occurrences.parquet'))
+			# Ensure rolling occurrence parquet is available locally for DuckDB read
+			existing_path = storage.ensure_local(os.path.join(GEO_DIR,'occurrences.parquet'), GEO_DIR)
+			existing_occurrence_parquet = db.read_parquet(existing_path)
 			db.execute(f"""
 				INSTALL spatial;
 				LOAD spatial;
@@ -427,10 +433,12 @@ def process_incremental_update(manifest,filename):
 			if settings.VERBOSE: db.sql("SELECT * FROM occurrences").show(max_rows=200)
 			# Write to disc using COPY as write_parquet() doesn't do geoparquet well
 			db.sql(f"""COPY existing_occurrences TO '{os.path.join(GEO_DIR, "occurrences.parquet")}';""")
+			# Upload refreshed rolling occurrence parquet to S3 when backend is active
+			if storage.is_s3(): storage.upload(os.path.join(GEO_DIR, 'occurrences.parquet'))
 			print(f"IMPORT : Wrote updated occurrences.parquet to {GEO_DIR}")
 		# Update manifest
 		manifest['last_processed_download_key'] =  manifest.get('current_download_key')
-		with open(os.path.join(GEO_DIR,'manifest.json'),'w') as f: json.dump(manifest, f, indent=4)
+		save_manifest(manifest)
 		print(f"IMPORT : Updated manifest, occurrence update complete")
 
 # Initial bootstrap: extract full GBIF occurrence snapshot (~200GB zip) into geoparquet
@@ -442,13 +450,15 @@ def distill_occurrences():
 		extract_from_zip(zip,db)
 		# Write to disc using COPY as write_parquet() doesn't do geoparquet well
 		db.sql(f"""COPY occurrences TO '{os.path.join(GEO_DIR, "occurrences.parquet")}';""")
+		# Upload freshly distilled rolling occurrence parquet to S3 when backend is active
+		if storage.is_s3(): storage.upload(os.path.join(GEO_DIR, 'occurrences.parquet'))
 		print(f"IMPORT : Wrote occurrences.parquet to {GEO_DIR}")
 
 # Load occurrence manifest (tracks download keys and processing state)
 def get_manifest() -> dict:
 	# Try fetching manifest
 	try: 
-		with open(os.path.join(GEO_DIR,'manifest.json'), 'r') as f: return json.load(f)
+		return storage.read_json(os.path.join(GEO_DIR,'manifest.json'))
 	# Error logging
 	except FileNotFoundError: print(f"IMPORT : No GBIF occurrence manifest found")
 	except json.JSONDecodeError: print(f"IMPORT : GBIF occurrence manifest corrupted")	

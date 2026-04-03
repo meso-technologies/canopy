@@ -17,6 +17,8 @@ import gzip, os, ssl, zipfile
 import aiohttp
 from ..utils.filehandlers import get_file
 from ..utils.downloader import get_local_source_file, get_timestamp_remote
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 
 # DB
 import duckdb
@@ -44,6 +46,8 @@ async def update_bhl(session):
 		source['latest_download'] = local
 		# Extract YYYYMMDD timestamp from the filename
 		source['timestamp_download'] = int(local.split('.')[1])
+		# Ensure local processing path exists even when canonical copy lives in S3
+		source['local_path'] = storage.ensure_local(os.path.join(SRC_DIR, local), SRC_DIR)
 		print(f"IMPORT : Latest local version of bhl is from {source['timestamp_download']}")
 	# Fetch the remote timestamp from S3 Last-Modified header if downloads are enabled
 	source['timestamp_remote'] = await get_timestamp_remote(source) if settings.CHECK_FOR_DOWNLOADS else 0
@@ -60,19 +64,21 @@ async def update_bhl(session):
 	if local and local.endswith('.zip'):
 		try:
 			# Try opening and reading the zip directory to confirm it's valid
-			with zipfile.ZipFile(f"{SRC_DIR}/{local}", 'r') as test:
+			with zipfile.ZipFile(source.get('local_path') or f"{SRC_DIR}/{local}", 'r') as test:
 				test.namelist()
 		except (zipfile.BadZipFile, Exception):
 			# Remove the corrupt zip so we re-download
 			print(f"IMPORT : Removing corrupt {local}")
 			os.remove(f"{SRC_DIR}/{local}")
 			# Also clean up any leftover temp files from the crashed run
-			for f in os.listdir(SRC_DIR):
-				if f.startswith(local) and f.endswith('.tmp'): os.remove(f"{SRC_DIR}/{f}")
+			if os.path.isdir(SRC_DIR):
+				for f in os.listdir(SRC_DIR):
+					if f.startswith(local) and f.endswith('.tmp'): os.remove(f"{SRC_DIR}/{f}")
 			# Reset local state so we trigger a fresh download
 			local = None
 			source.pop('latest_download', None)
 			source.pop('timestamp_download', None)
+			source.pop('local_path', None)
 	# Compare local and remote timestamps to decide if we need a fresh download
 	need_download = source.get('timestamp_remote') and (not local or source['timestamp_remote'] > source.get('timestamp_download', 0))
 	# Download individual gz files from S3 and assemble into a zip matching the old format
@@ -112,6 +118,10 @@ async def update_bhl(session):
 					print(f"IMPORT : Added Data/{filename}")
 		# Point the source dict at the newly created zip
 		source['latest_download'] = f"bhl.{datehash}.zip"
+		# Store the local processing path for this run
+		source['local_path'] = target
+		# Upload assembled zip to S3 when backend is active
+		if storage.is_s3(): storage.upload(target, f"source/{source['latest_download']}")
 		# Store the download timestamp for processed-file comparison
 		source['timestamp_download'] = datehash
 		print(f"IMPORT : Built {target}")
@@ -133,8 +143,10 @@ async def update_bhl(session):
 # Process a fresh source file
 def process_bhl(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
+	# Resolve local source path (already ensured in update_bhl for S3 mode)
+	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
-	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+	with zipfile.ZipFile(source_path, 'r') as zip, duckdb.connect(':memory:') as db:
 		# Almost guarantueed to need a temp dir:
 		db.execute(f"SET temp_directory = '{ TMP_DIR }'")
 

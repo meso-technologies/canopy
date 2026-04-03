@@ -4,6 +4,8 @@
 import os, requests, time
 from .. import settings, API_DATA_DIR, RELEASES_DIR, TMP_DIR
 from ..utils.filehandlers import get_latest_release, get_file
+# Load shared storage proxy for local/S3 transparent parquet operations
+from ..utils.s3 import storage
 # Data processing
 import duckdb, pyarrow
 
@@ -20,8 +22,10 @@ def update_wikipedia(release=None):
 	with duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
+		# Configure DuckDB S3 settings when reading/writing parquet in object storage
+		if storage.is_s3(): storage.configure_duckdb(db)
 		# Check if we have any wikipedia abstracts at all
-		if not os.path.isfile(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet")): 
+		if not storage.exists(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet")): 
 			print(f"IMPORT : No Wikipedia abstracts found, building dataset from scratch")
 			build_abstracts(release,db)
 		else:
@@ -31,11 +35,11 @@ def update_wikipedia(release=None):
 # Build a new abstract dataset from scratch
 def build_abstracts(release: dict, db: duckdb.DuckDBPyConnection, update_only: bool=False):
 	# Grab the basic data, one ID only if we still have duplicates from our importer
-	meso_parquet = db.read_parquet(os.path.join(RELEASES_DIR, f"{release['version']}/{release['version']}.parquet"))
+	meso_parquet = db.read_parquet(storage.parquet_url(os.path.join(RELEASES_DIR, f"{release['version']}/{release['version']}.parquet")))
 	# Register download function as pyarrow UDF
 	db.create_function('download_abstracts',download_abstracts,['VARCHAR'],'VARCHAR',type='arrow',side_effects=True)
 	# Spawn a new table if we don't have one
-	if not update_only or not os.path.isfile(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet")):
+	if not update_only or not storage.exists(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet")):
 		db.execute(f"""CREATE TABLE wikipedia_abstracts AS SELECT id_meso, name_consensus, wikidata_id, wikipedia_page AS en_page_title FROM meso_parquet WHERE accepted;""")
 		print(f"IMPORT : Loaded {db.execute("SELECT COUNT(*) FROM wikipedia_abstracts").fetchone()[0]:,} candidates from release {release['version']}.parquet into new table")
 		# Download up to 20 abstracts at a time, via page title first
@@ -53,7 +57,7 @@ def build_abstracts(release: dict, db: duckdb.DuckDBPyConnection, update_only: b
 		print(f"IMPORT : Fresh download via Wikipedia API complete, {db.execute("SELECT COUNT(*) FROM wikipedia_abstracts WHERE abstract IS NOT NULL").fetchone()[0]:,} abstracts found")
 	# Otherwise update our existing table
 	else:
-		wikipedia_parquet = db.read_parquet(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet"))	
+		wikipedia_parquet = db.read_parquet(storage.parquet_url(os.path.join(API_DATA_DIR, f"wikipedia_abstracts.parquet")))	
 		db.execute(f"""CREATE TABLE wikipedia_abstracts AS SELECT * FROM wikipedia_parquet;""")
 		existing_rowcount = db.execute("SELECT COUNT(*) FROM wikipedia_abstracts").fetchone()[0]
 		print(f"IMPORT : Loaded {existing_rowcount:,} rows from existing wikipedia_abstracts.parquet")
@@ -91,8 +95,9 @@ def build_abstracts(release: dict, db: duckdb.DuckDBPyConnection, update_only: b
 	if settings.VERBOSE: db.sql("SELECT * FROM wikipedia_abstracts").show(max_rows=100)
 	# Write parquet
 	filename = os.path.join(API_DATA_DIR, f"wikipedia_abstracts")
-	db.sql(f"SELECT * FROM wikipedia_abstracts").write_parquet(filename + '.parquet')
-	print(f"IMPORT : Saved Wikipedia abstracts file to {filename}")
+	output_path = storage.parquet_url(filename + '.parquet')
+	db.execute(f"COPY wikipedia_abstracts TO '{output_path}' (FORMAT PARQUET)")
+	print(f"IMPORT : Saved Wikipedia abstracts file to {output_path}")
 	# Write .csv as well if we have our flag set
 	if settings.CSV: db.sql(f"SELECT * FROM wikipedia_abstracts").write_csv(filename + '.tsv',sep='\t') 
 

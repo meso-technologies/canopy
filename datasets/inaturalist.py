@@ -42,8 +42,10 @@ async def update_inaturalist(session):
 # Process a fresh sourcefile
 def process_inaturalist(source: dict):
 	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
+	# Resolve local source path (already ensured by fetch in S3 mode)
+	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
-	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+	with zipfile.ZipFile(source_path, 'r') as zip, duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial csv file, turning off strict as the 'references' field has a bunch of errors (URLs with commas, quotes etc)

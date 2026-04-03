@@ -10,6 +10,8 @@ import asyncio
 import aiohttp
 # Load canopy settings proxy and settings builder
 from . import settings, build_settings
+# Load storage proxy for startup backend status logging
+from .utils.s3 import storage
 
 # Define source execution order so fusion gets expected dependencies
 sources = ['ipni', 'fungorum', 'wcvp', 'powo', 'wfo', 'col', 'tropicos', 'mycobank', 'bhl', 'gbif', 'wikidata', 'wikispecies', 'inaturalist', 'iucn', 'ncbi']
@@ -38,6 +40,8 @@ async def main(argv=None):
 	parser.add_argument('--geo', action='store_true', help='Geospatial processing')
 	# Execute API-backed enrichment stage (Wikipedia abstracts)
 	parser.add_argument('--apis', action='store_true', help='Update API-backed enrichment datasets like Wikipedia abstracts')
+	# Enable S3-compatible storage backend for canopy data paths
+	parser.add_argument('--s3', action='store_true', help='Use configured S3 storage backend instead of local storage')
 	# Parse CLI args (or injected argv from wrapper)
 	args = parser.parse_args(argv)
 	# Build runtime settings class from CLI profile/flags
@@ -48,6 +52,12 @@ async def main(argv=None):
 	settings.set_config(runtime)
 	# Announce canopy start for long-running logs
 	print('CANOPY : Starting canopy pipeline')
+	# Log active storage backend mode after runtime settings are initialized
+	if runtime.USE_S3 and storage.is_s3(): print('CANOPY : Using S3 as storage backend')
+	# Log graceful fallback when S3 was requested but config is incomplete
+	elif runtime.USE_S3 and not storage.is_s3(): print('CANOPY : S3 not available, check config/secrets and run update.sh, falling back on local storage')
+	# Log default local backend mode
+	else: print('CANOPY : Using local storage backend')
 	# Set a shared request timeout for direct HTTP operations
 	timeout = aiohttp.ClientTimeout(total=60 * 120)
 	# Protect full pipeline execution with top-level error handling

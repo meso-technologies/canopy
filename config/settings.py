@@ -1,8 +1,8 @@
 # Runtime settings for canopy pipeline
 import uuid
 
-# Import canopy credentials from local secrets file
-from .secrets import GBIF_USER, GBIF_PASSWORD, WIKIDATA_TOKEN
+# Import canopy secrets module for optional credentials and storage settings
+from . import secrets
 
 # Base canopy runtime defaults
 class Base:
@@ -22,9 +22,17 @@ class Base:
 	# Full run by default
 	BACKBONE_LOOPS = 0
 	# Optional API credentials
-	GBIF_USER = GBIF_USER
-	GBIF_PASSWORD = GBIF_PASSWORD
-	WIKIDATA_TOKEN = WIKIDATA_TOKEN
+	GBIF_USER = getattr(secrets, 'GBIF_USER', '')
+	GBIF_PASSWORD = getattr(secrets, 'GBIF_PASSWORD', '')
+	WIKIDATA_TOKEN = getattr(secrets, 'WIKIDATA_TOKEN', '')
+	# Toggle for enabling S3 mode at runtime
+	USE_S3 = False
+	# Optional S3 storage credentials and endpoint settings
+	S3_BUCKET = getattr(secrets, 'S3_BUCKET', '') or None
+	S3_ENDPOINT = getattr(secrets, 'S3_ENDPOINT', '') or None
+	S3_REGION = getattr(secrets, 'S3_REGION', '') or None
+	S3_ACCESS_KEY = getattr(secrets, 'S3_ACCESS_KEY', '') or None
+	S3_SECRET_KEY = getattr(secrets, 'S3_SECRET_KEY', '') or None
 
 # Fast partial-data profile for local development
 class Debug(Base):
@@ -54,6 +62,8 @@ def build_settings(args):
 		VERBOSE = bool(getattr(args, 'verbose', False)) or profile.VERBOSE
 		FORCE = bool(getattr(args, 'force', False)) or profile.FORCE
 		CSV = bool(getattr(args, 'csv', False)) or profile.CSV
+		# Enable S3 backend only when explicitly requested on CLI
+		USE_S3 = bool(getattr(args, 's3', False))
 	return Runtime
 
 # Export settings proxy

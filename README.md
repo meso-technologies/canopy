@@ -8,8 +8,8 @@ Canopy builds a unified taxonomy release from multiple botanical and mycological
 # Simple full run
 uv run python -m importer.canopy.run 
 
-# Download only
-uv run python -m importer.canopy.run --download
+# Download only, use S3 as storage instead of local
+uv run python -m importer.canopy.run --download --s3
 
 # Process + fuse + geo + APIs
 uv run python -m importer.canopy.run --process --fuse --geo --apis
@@ -30,6 +30,7 @@ uv run python -m importer.canopy.run --debug --process --fuse
 - `--fuse` — build fused release output
 - `--geo` — compute geospatial artifact
 - `--apis` — run API-backed enrichment (Wikipedia abstracts etc)
+- `--s3` — use S3 storage backend (needs creds in `config/secrets.py`)
 
 ## Setup & Secrets
 

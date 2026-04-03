@@ -70,9 +70,12 @@ def process_tropicos(sources: dict):
 	with duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
+		# Resolve local source paths for both Tropicos archives
+		specimen_path = sources[0].get('local_path') or f"{SRC_DIR}/{sources[0]['latest_download']}"
+		nonmo_path = sources[1].get('local_path') or f"{SRC_DIR}/{sources[1]['latest_download']}"
 		# Open zips seperately, the tow datasets are either plants at Missouri University or external sources (Non-MO)
-		specimen = zipfile.ZipFile(f"{SRC_DIR}/{sources[0]['latest_download']}")
-		nonmo = zipfile.ZipFile(f"{SRC_DIR}/{sources[1]['latest_download']}")
+		specimen = zipfile.ZipFile(specimen_path)
+		nonmo = zipfile.ZipFile(nonmo_path)
 		# Load occurence.txts into DuckDB
 		specimen_tsv = db.read_csv(specimen.open('occurrence.txt'),parallel=True)
 		nonmo_tsv = db.read_csv(nonmo.open('occurrence.txt'),parallel=True)

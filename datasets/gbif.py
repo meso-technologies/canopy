@@ -41,8 +41,10 @@ async def update_gbif(session):
 	return source
 
 def process_gbif(source: dict):
+	# Resolve local source path (already ensured by fetch in S3 mode)
+	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
-	with zipfile.ZipFile(f"{SRC_DIR}/{source['latest_download']}", 'r') as zip, duckdb.connect(':memory:') as db:
+	with zipfile.ZipFile(source_path, 'r') as zip, duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load the initial tsv files

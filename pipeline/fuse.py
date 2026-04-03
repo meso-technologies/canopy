@@ -13,12 +13,14 @@
 #			TODO: Handle outdated genus like asclepiadaceae
 #			TODO: order (cupressales │ pinales | pinales) class (equisetopsida │ magnoliopsida │ equisetopsida) and phylum (streptophyta │ tracheophyta │ streptophyta) all seem to have one mismatch each
 
-import os, shutil
+import os
 
 # Settings
 from .. import PROCESSED_DIR, RELEASES_DIR, TMP_DIR, settings
 from ..utils.filehandlers import check_release, get_latest_processed
 from ..utils.queries import write_to_disc
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 # DB
 import duckdb
 # UDFs
@@ -65,6 +67,8 @@ def fuse(results):
 	with duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
+		# Configure DuckDB S3 settings when reading/writing S3 parquet files
+		if storage.is_s3(): storage.configure_duckdb(db)
 		# MAP phase: maximize name coverage and cross-source identifier linking
 		print(f"IMPORT : ############### Building Initial Name Index ###############")
 		# Load data
@@ -519,7 +523,8 @@ def enrich(results: dict, db: duckdb.DuckDBPyConnection):
 	# Add wikipedia author Q identifier and BHL page
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS qauthor VARCHAR;""")
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS bhl_page UINTEGER;""")
-	db.execute(f"""UPDATE meso m SET qauthor = w.qauthor, bhl_page = w.bhl_page FROM wikidata w WHERE m.wikidata_id = w.id_raw;""")	
+	# Parse BHL page from wikidata as first numeric chunk (e.g. 665972-1 -> 665972) and null invalid values instead of failing fusion
+	db.execute(f"""UPDATE meso m SET qauthor = w.qauthor, bhl_page = TRY_CAST(regexp_extract(w.bhl_page, '^(\\d+)', 1) AS UINTEGER) FROM wikidata w WHERE m.wikidata_id = w.id_raw;""")
 	# Add perennial / annual from POWO 
 	db.execute(f"""
 		UPDATE meso SET 
@@ -1261,22 +1266,22 @@ def package_release(results: dict, db: duckdb.DuckDBPyConnection):
 		# Otherwise remove the existing dir
 		else:
 			print(f"IMPORT : Deleting existing release { release }")
-			shutil.rmtree(os.path.join(RELEASES_DIR, release))
+			storage.rmtree(os.path.join(RELEASES_DIR, release))
 	# Create release directory
 	release_dir = os.path.join(RELEASES_DIR, release)
-	os.mkdir(release_dir)
+	storage.makedirs(release_dir)
 	# Write our data
 	write_to_disc(db, { "name": "meso" }, release_dir, release)
 	# Copy processed input files to release
 	for result in results: 
 		processed_file = os.path.join(PROCESSED_DIR,results[result].get('latest_processed'))
-		print(f"IMPORT : Copying { processed_file } to { release_dir}")
-		shutil.copy2(processed_file, release_dir)
+		target_file = os.path.join(release_dir, results[result].get('latest_processed'))
+		print(f"IMPORT : Copying { processed_file } to { target_file }")
+		storage.copy(processed_file, target_file)
 	# Create manifest
 	manifest = { 'version': release, 'sources': results}
 	# Write manifest to disc
-	with open(os.path.join(release_dir,'manifest.json'), 'w') as f:
-		json.dump(manifest, f, indent=4)	
+	storage.write_json(os.path.join(release_dir,'manifest.json'), manifest)
 	# Return data for next step	
 	return manifest
 
@@ -1287,7 +1292,7 @@ def package_release(results: dict, db: duckdb.DuckDBPyConnection):
 #
 # Load a parquet into memory tem table
 def load_parquet(results: dict, db: duckdb.DuckDBPyConnection, source: str):
-	parquet = db.read_parquet(os.path.join(PROCESSED_DIR, results[source].get('latest_processed')))
+	parquet = db.read_parquet(storage.parquet_url(os.path.join(PROCESSED_DIR, results[source].get('latest_processed'))))
 	db.execute(f"CREATE TEMP TABLE {source} AS SELECT * FROM parquet")
 	print(f"IMPORT : Loaded {source} data into memory / temp table")
 	if settings.VERBOSE: db.sql(f"SUMMARIZE {source}").show(max_rows=40)

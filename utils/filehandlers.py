@@ -5,6 +5,8 @@ import os, time, sys, importlib
 from .. import PROCESSED_DIR, SRC_DIR, TMP_DIR, RELEASES_DIR, settings
 # Load download helpers used by source fetch logic
 from ..utils.downloader import pull, get_local_source_file
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 
 # Track wrapper-distilled release artifact prefixes for cleanup logic
 releasefiles = ['precog','typesense','postgres','taxonext','citations','timeline','rarities']
@@ -22,6 +24,14 @@ async def fetch(session, source: dict) -> bool:
 	if settings.CHECK_FOR_DOWNLOADS: 
 		# See if we have a new file successfully downloaded
 		if await pull(session, source): print(f"IMPORT : Successfully fetched new remote version of { source['name'] }.")
+	# Ensure source processing path is available locally for downstream zip/gzip consumers
+	if source.get('latest_download'):
+		# Build canonical source path under canopy source directory
+		source_path = os.path.join(SRC_DIR, source['latest_download'])
+		# Skip local hydration during download-only runs
+		if settings.DOWNLOAD_ONLY: source['local_path'] = source_path
+		# Ensure source file exists locally even when canonical copy lives in S3
+		else: source['local_path'] = storage.ensure_local(source_path, SRC_DIR)
 	# If we haven't checked for the latest processed file yet	
 	if not source.get('latest_processed'):
 		# Fetch the latest processed file
@@ -43,8 +53,8 @@ async def fetch(session, source: dict) -> bool:
 def get_latest_processed() -> dict | None:
 	sources = {} 
 	datasets = []
-	# Go through dir
-	for file in os.listdir(PROCESSED_DIR):
+	# Go through processed entries from active storage backend
+	for file in storage.list_files(PROCESSED_DIR, suffix='.parquet'):
 		# Only consider parquet files
 		if not file.endswith('.parquet'): continue
 		# Get the dataset name
@@ -77,12 +87,12 @@ def get_file(starts_with: str, dir=None) -> str | None:
 	# Default to processed dir
 	if not dir: dir = PROCESSED_DIR
 	newest_file = None
-	# Go through dir
-	for file in os.listdir(dir):
+	# Go through candidate files from active storage backend
+	for file in storage.list_files(dir, prefix=str(starts_with + '.'), suffix='.parquet'):
 		# See if we have a match
-		if file.startswith(str(starts_with + '.')) and file.count('.') == 2 and os.path.splitext(file)[1] == '.parquet':
+		if file.count('.') == 2 and os.path.splitext(file)[1] == '.parquet':
 			# Compare timestamps
-			if not newest_file or int(file.split('.')[1] > newest_file.split('.')[1]):
+			if not newest_file or int(file.split('.')[1]) > int(newest_file.split('.')[1]):
 				# Assign the latest we found
 				newest_file = file
 	# Return None or our newest file
@@ -96,17 +106,16 @@ def delete_older_files(filename: str, datehash: str, dir) -> None:
 		print(f"IMPORT : WARNING, TRIED TO DELETE FILES IN { dir }")
 		return
 	try:
-		for file in os.listdir(dir):
-			# Continue the loop if it's not a file (i.e. it's a directory)
+		for file in storage.list_files(dir, prefix=filename + '.'):
+			# Build full path for deletion via storage backend
 			full_path = os.path.join(dir, file)
-			if not os.path.isfile(full_path): continue
 			# Ignore other files, make sure to use delimiting dot as we have wikispecies-foo etc
 			if not file.startswith(filename + '.'): continue
 			# Compare hashes, this shouldn't be larger but lets leave it in anyway for now
 			if int(file.split('.')[1]) >= int(datehash): continue
 			# Delete if we made it all the way here
 			print(f"IMPORT : Deleting old file { dir }/{ file }")
-			os.remove(f"{ dir }/{ file }")
+			storage.delete(full_path)
 	except Exception as e:
 		print(f"IMPORT : Unable to delete { filename } {type(e).__name__ } { e }.")	
 
@@ -114,8 +123,10 @@ def delete_older_files(filename: str, datehash: str, dir) -> None:
 def check_release(release,dir=None):
 	# Default to staging dir
 	if not dir: dir = RELEASES_DIR
-	release_path = os.path.join(dir, release)
-	return os.path.exists(release_path) and os.path.isdir(release_path)
+	# Resolve release manifest path as canonical release-exists check
+	release_path = os.path.join(dir, release, 'manifest.json')
+	# Return true when release manifest exists in active storage backend
+	return storage.exists(release_path)
 
 # Load latest release manifest based on YYYYMMDD-hash release folder naming
 def get_latest_release(release_dir=None):
@@ -124,10 +135,10 @@ def get_latest_release(release_dir=None):
 	newest_date = None
 	# Default to staging dir
 	if not release_dir: release_dir = RELEASES_DIR
-	# Go through dir
-	for entry in os.listdir(release_dir):	
+	# Go through release directories from active storage backend
+	for entry in storage.list_dirs(release_dir):	
 		# Check if it's a proper release
-		if os.path.isdir(os.path.join(release_dir, entry)) and re.match(r'^\d{8}-[a-f0-9]+$', entry):
+		if re.match(r'^\d{8}-[a-f0-9]+$', entry):
 			# Extract date part
 			date_str = entry.split('-')[0]
 			# If this is the first valid directory or newer than our current newest
@@ -140,7 +151,7 @@ def get_latest_release(release_dir=None):
 		return	
 	# Try fetching manifest
 	try: 
-		with open(os.path.join(release_dir, newest_release + '/manifest.json'), 'r') as f: return json.load(f)
+		return storage.read_json(os.path.join(release_dir, newest_release, 'manifest.json'))
 	# Error logging
 	except FileNotFoundError: print(f"IMPORT : No manifest found in { newest_release }")
 	except json.JSONDecodeError: print(f"IMPORT : { newest_release } release manifest corrupted")	
@@ -158,17 +169,16 @@ def cleanup_release(dir, manifest):
 	try:
 		# Do list comprehension only once
 		current_files = [manifest[key] for key in releasefiles]
-		for file in os.listdir(release_dir):
-			# Continue the loop if it's not a file (i.e. it's a directory)
+		for file in storage.list_files(release_dir):
+			# Build full path for deletion via storage backend
 			full_path = os.path.join(release_dir, file)
-			if not os.path.isfile(full_path): continue
 			# Ignore other files, make sure to use delimiting dot as we have wikispecies-foo etc
 			if not file.split('.')[0] in releasefiles: continue
 			# Check if it's a file we actually want to keep
 			if file in current_files: continue
 			# Delete if we made it all the way here
 			print(f"IMPORT : Deleting old file { release_dir }/{ file }")
-			os.remove(f"{ release_dir }/{ file }")
+			storage.delete(full_path)
 	except Exception as e:
 		print(f"IMPORT : Unable to delete file in { release_dir } {type(e).__name__ } { e }.")	
 
@@ -198,7 +208,7 @@ def get_system_resources() -> list[int, int]:
 def filter_gzip(source: dict, pattern: str):
 	print(f"IMPORT : Filtering large gzip file { source['latest_download']}")
 	# Sanity
-	file = os.path.join(SRC_DIR, source['latest_download'])
+	file = source.get('local_path') or os.path.join(SRC_DIR, source['latest_download'])
 	if not os.path.isfile(file):
 		print(f"IMPORT : File not found { source['latest_download']}")	
 		return	

@@ -3,8 +3,11 @@
 #			Generally should be called in the order they listed here, ie do name cleanup after having found hybrids and removed ranks/authors
 #
 
+import os
 import duckdb
 from .. import settings, PROCESSED_DIR
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 
 # Filters most of the series, pages, year etc out of publications:
 publication_filter = "'^(.*?)(?:\\s+\\d+(?:\\s*\\([^)]*\\))?(?:\\s*:|$))'"
@@ -240,9 +243,13 @@ def write_to_disc(db: duckdb.DuckDBPyConnection, source: dict, dir = PROCESSED_D
 	if not filename: filename = f"{ source['name'] }.{ source['timestamp_download'] }"
 	# Get number of rows
 	rows = db.sql(f"SELECT COUNT(*) FROM {source['name']}").fetchone()[0]
-	# Write parquet
-	db.sql(f"SELECT * FROM {source['name']}").write_parquet(f"{ dir }/{ filename }.parquet")
-	print(f"IMPORT : Wrote {rows:,} rows to parquet file { dir }/{ filename }.parquet")
+	# Build canonical output path for local or S3 parquet writes
+	output_path = storage.parquet_url(os.path.join(dir, f"{ filename }.parquet"))
+	# Configure DuckDB S3 settings when writing to object storage
+	if storage.is_s3(): storage.configure_duckdb(db)
+	# Write parquet via COPY for consistent local and S3 support
+	db.execute(f"COPY {source['name']} TO '{output_path}' (FORMAT PARQUET)")
+	print(f"IMPORT : Wrote {rows:,} rows to parquet file {output_path}")
 	# Write .csv as well if we have our flag set
 	if settings.CSV: 
 		db.sql(f"SELECT * FROM {source['name']}").write_csv(f"{ dir }/{ filename }.tsv",sep='\t') 

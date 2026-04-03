@@ -43,6 +43,8 @@ from .. import settings, RELEASES_DIR, GEO_DIR, TMP_DIR
 from ..utils.filehandlers import get_latest_release, get_file
 # Occurrence updater to refresh rolling occurrence parquet before geo run
 from ..datasets.occurrences import update_occurrences
+# Load shared storage proxy for local/S3 transparent file operations
+from ..utils.s3 import storage
 
 # Mercator latitude limit — beyond this the projection is undefined
 MAX_LAT = 85.0511
@@ -104,6 +106,12 @@ async def compute_geospatial(release):
 		return
 	# Refresh rolling occurrence dataset before geospatial computation
 	await update_occurrences()
+	# Ensure release and occurrence parquet inputs exist locally when running in S3 mode
+	if storage.is_s3():
+		# Pull release parquet from S3 into release directory for local polars scans
+		storage.ensure_local(os.path.join(RELEASES_DIR, release.get('version'), f"{release.get('version')}.parquet"), os.path.join(RELEASES_DIR, release.get('version')))
+		# Pull rolling occurrences parquet from S3 into geo directory for local polars scans
+		storage.ensure_local(os.path.join(GEO_DIR, 'occurrences.parquet'), GEO_DIR)
 	# Guard against missing occurrence parquet after update
 	if not os.path.isfile(os.path.join(GEO_DIR, 'occurrences.parquet')):
 		# Log missing prerequisite dataset
@@ -830,7 +838,7 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 	# Build date-stamped geo artifact name
 	filename = f"geo.{datetime.now(timezone.utc).strftime('%Y%m%d')}.parquet"
 	# Resolve final output parquet path
-	output_path = os.path.join(release_dir, filename).replace('\\', '/')
+	output_path = storage.parquet_url(os.path.join(release_dir, filename))
 	# Resolve temporary directory for partitioned packaging output
 	parts_dir = os.path.join(TMP_DIR, f"geo_package_parts_{release.get('version')}")
 	# Normalize input parquet paths for DuckDB SQL literals
@@ -855,6 +863,8 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 	with duckdb.connect(':memory:') as db:
 		# Route temporary spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
+		# Configure DuckDB S3 settings when writing final geo artifact to object storage
+		if storage.is_s3(): storage.configure_duckdb(db)
 		# Allow DuckDB to optimize grouping without preserving insertion order
 		db.execute("SET preserve_insertion_order = false")
 		# Keep large Arrow string buffers enabled for wide JSON payload safety
@@ -937,4 +947,4 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 	# Attach geo filename to release manifest payload
 	release['geo'] = filename
 	# Persist release manifest with new geo artifact reference
-	with open(os.path.join(release_dir, 'manifest.json'), 'w', encoding='utf-8') as f: json.dump(release, f, indent=4)
+	storage.write_json(os.path.join(release_dir, 'manifest.json'), release)
