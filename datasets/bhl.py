@@ -124,6 +124,8 @@ async def update_bhl(session):
 		source['local_path'] = target
 		# Upload assembled zip to S3 when backend is active
 		if storage.is_s3(): storage.upload(target, f"source/{source['latest_download']}")
+		# Remove local assembled zip after successful S3 upload in download-only mode
+		if storage.is_s3() and settings.DOWNLOAD_ONLY and os.path.isfile(target): os.remove(target)
 		# Store the download timestamp for processed-file comparison
 		source['timestamp_download'] = datehash
 		print(f"IMPORT : Built {target}")

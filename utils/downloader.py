@@ -7,8 +7,8 @@ from datetime import datetime
 # Load URL/path suffix extraction helpers
 from pathlib import PurePath
 
-# Load canopy source directory constant
-from .. import SRC_DIR
+# Load canopy source directory constant and runtime settings
+from .. import SRC_DIR, settings
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
 
@@ -89,6 +89,8 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 			if not success: return None
 			# Upload completed local file to S3 when S3 backend is active
 			if storage.is_s3(): storage.upload(target_path, f"source/{target_file}")
+			# Remove local file after successful S3 upload in download-only mode
+			if storage.is_s3() and settings.DOWNLOAD_ONLY and os.path.isfile(target_path): os.remove(target_path)
 			# Keep placeholder branch for future aria-specific timestamp extraction
 			if not datehash:
 				# No-op for now because datehash is expected from remote timestamp lookup
@@ -119,6 +121,8 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 					await file.write(data)
 					# Upload completed local file to S3 when S3 backend is active
 					if storage.is_s3(): storage.upload(target_path, f"source/{target_file}")
+					# Remove local file after successful S3 upload in download-only mode
+					if storage.is_s3() and settings.DOWNLOAD_ONLY and os.path.isfile(target_path): os.remove(target_path)
 					# Remove older local files after successful write
 					delete_older_files(filename, datehash, SRC_DIR)
 					# Store downloaded timestamp for downstream processing checks
