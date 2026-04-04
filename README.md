@@ -2,7 +2,7 @@
 
 Canopy builds a unified taxonomy release from multiple botanical and mycological authorities. It keeps source provenance visible, reconciles differences in acceptance and classification, and produces practical outputs for search, hierarchy browsing, and geospatial enrichment.
 
-## Run Examples
+## Examples
 
 ```bash
 # Simple full run
@@ -32,6 +32,11 @@ uv run python -m importer.canopy.run --debug --process --fuse
 - `--apis` — run API-backed enrichment (Wikipedia abstracts etc)
 - `--s3` — use S3 storage backend (needs creds in `config/secrets.py`)
 
+## Environment Variables
+
+- `CANOPY_DATA_DIR` — override canopy data root directory (default: `canopy/data`).
+- `CANOPY_USER_AGENT` — outbound HTTP `User-Agent` string for source/API requests (default: `Canopy Taxonomy Pipeline/1.0 (opensource@meso.cloud)`).
+
 ## Setup & Secrets
 
-Run `./setup.sh` once and `./update.sh` occasionally. Copy `config/secrets.py.template` to `config/secrets.py` and fill credentials before running. Missing credentials are handled gracefully (GBIF updates are skipped).
+Run `./setup.sh` once and `./update.sh` occasionally. Copy `config/secrets.py.template` to `config/secrets.py` and fill credentials before running. Missing credentials are handled gracefully (GBIF updates are skipped, S3 mode disabled).

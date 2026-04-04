@@ -1,4 +1,5 @@
 # Runtime settings for canopy pipeline
+import os
 import uuid
 
 # Import canopy secrets module for optional credentials and storage settings
@@ -25,6 +26,8 @@ class Base:
 	GBIF_USER = getattr(secrets, 'GBIF_USER', '')
 	GBIF_PASSWORD = getattr(secrets, 'GBIF_PASSWORD', '')
 	WIKIDATA_TOKEN = getattr(secrets, 'WIKIDATA_TOKEN', '')
+	# Optional outbound user agent header with OSS-safe default and env override
+	HTTP_USER_AGENT = os.getenv('CANOPY_USER_AGENT', 'Canopy Taxonomy Pipeline/1.0 (opensource@meso.cloud)')
 	# Toggle for enabling S3 mode at runtime
 	USE_S3 = False
 	# Optional S3 storage credentials and endpoint settings
