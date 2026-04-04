@@ -61,7 +61,8 @@ async def main(argv=None):
 	# Log default local backend mode
 	else: print('CANOPY : Using local storage backend')
 	# Set a shared request timeout for direct HTTP operations
-	timeout = aiohttp.ClientTimeout(total=60 * 120)
+	# Full download runs can exceed 2 hours due large source throttling (for example Wikidata)
+	timeout = aiohttp.ClientTimeout(total=60 * 60 * 8)
 	# Protect full pipeline execution with top-level error handling
 	try:
 		# Track stage-level failures so wrapper can stop on canopy errors

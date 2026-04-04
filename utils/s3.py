@@ -6,6 +6,8 @@ import json
 import os
 # Load SSL context for parity with existing downloader behavior
 import ssl
+# Load timing helpers for periodic multipart progress logging
+import time
 # Load canopy paths and settings proxy
 from .. import DATA_DIR, settings
 
@@ -451,8 +453,16 @@ class S3Storage:
 		object_key = key.replace('\\', '/')
 		# Pick multipart chunk size above S3 minimum part size
 		chunk_size = 16 * 1024 * 1024
+		# Log every 512MB to keep journals concise for very large files
+		log_step_bytes = 512 * 1024 * 1024
 		# Track uploaded part descriptors for completion
 		parts = []
+		# Track uploaded payload bytes for progress logging
+		total_uploaded_bytes = 0
+		# Track next byte threshold for emitting progress logs
+		next_log_threshold = log_step_bytes
+		# Track start time for average throughput calculations
+		start_time = time.monotonic()
 		# Start multipart upload and capture upload id
 		create = await asyncio.to_thread(self.s3.create_multipart_upload, Bucket=self.bucket, Key=object_key)
 		upload_id = create['UploadId']
@@ -461,6 +471,8 @@ class S3Storage:
 			async with session.get(url, ssl=ssl.SSLContext()) as response:
 				# Raise for HTTP failures before uploading parts
 				response.raise_for_status()
+				# Log start of streamed multipart upload
+				print(f"IMPORT : Streaming {url} to s3://{self.bucket}/{object_key}")
 				# Start part numbering at 1 per S3 API contract
 				part_number = 1
 				# Stream source payload in fixed-size chunks
@@ -478,6 +490,18 @@ class S3Storage:
 					)
 					# Record uploaded part metadata for completion
 					parts.append({'PartNumber': part_number, 'ETag': upload['ETag']})
+					# Add current chunk length to uploaded byte counter
+					total_uploaded_bytes += len(chunk)
+					# Emit periodic progress logs when threshold was reached
+					if total_uploaded_bytes >= next_log_threshold:
+						# Compute elapsed seconds for throughput reporting
+						elapsed = max(time.monotonic() - start_time, 1e-6)
+						# Compute average MB/s since start of transfer
+						rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
+						# Log streamed upload progress with part counter and throughput
+						print(f"IMPORT : Streamed {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {part_number} parts avg {rate_mbps:.2f}MB/s")
+						# Move next progress threshold forward by one logging window
+						next_log_threshold += log_step_bytes
 					# Increment part number for next upload call
 					part_number += 1
 			# Complete multipart upload after all chunks succeeded
@@ -488,6 +512,12 @@ class S3Storage:
 				UploadId=upload_id,
 				MultipartUpload={'Parts': parts},
 			)
+			# Compute elapsed seconds for final completion summary
+			elapsed = max(time.monotonic() - start_time, 1e-6)
+			# Compute final average MB/s for completion summary
+			rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
+			# Log final streamed upload completion summary
+			print(f"IMPORT : Stream upload complete {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(parts)} parts avg {rate_mbps:.2f}MB/s")
 		except Exception:
 			# Abort multipart upload so partial objects are not left behind
 			await asyncio.to_thread(self.s3.abort_multipart_upload, Bucket=self.bucket, Key=object_key, UploadId=upload_id)
