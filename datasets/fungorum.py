@@ -15,6 +15,7 @@
 # 		unevaluated names to CoL+ which are not included in the original Species Fungorum as the AVC name or a synonym.
 
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -34,7 +35,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_fungorum(session):
-	print(f"IMPORT : ############### Starting Species Fungorum Update  ###############")
+	mesologger.info(f"############### Starting Species Fungorum Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_fungorum(source)
@@ -43,7 +44,7 @@ async def update_fungorum(session):
 
 # Process a fresh source file
 def process_fungorum(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
+	mesologger.info(f"Starting to process { source['latest_download'] }...")  
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -120,7 +121,7 @@ def process_fungorum(source: dict):
 			);
 		""")
 		# Log
-		print(f"IMPORT : Loaded { db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0] } fungi names from { source['name'] }")
+		mesologger.info(f"Loaded { db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0] } fungi names from { source['name'] }")
 		# TODO: Add a check to see if rank in name matches actual rank
 		# Find hybrids
 		find_hybrids(db,source)

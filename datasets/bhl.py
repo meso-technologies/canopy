@@ -10,6 +10,7 @@
 # 		part of a global “biodiversity community.”
 #
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -39,7 +40,7 @@ source = {
 
 # Custom update since BHL moved behind Cloudflare but publishes data on S3 as individual gz files
 async def update_bhl(session):
-	print(f"IMPORT : ############### Starting Biodiversity Heritage Library Update  ###############")
+	mesologger.info(f"############### Starting Biodiversity Heritage Library Update  ###############")
 	# Look for an existing local bhl zip
 	local = get_local_source_file(source['name'])
 	# Populate source dict with local version info if we have a previous download
@@ -50,18 +51,18 @@ async def update_bhl(session):
 		source['timestamp_download'] = int(local.split('.')[1])
 		# Ensure local processing path exists even when canonical copy lives in S3
 		source['local_path'] = storage.ensure_local(os.path.join(SRC_DIR, local), SRC_DIR)
-		print(f"IMPORT : Latest local version of bhl is from {source['timestamp_download']}")
+		mesologger.info(f"Latest local version of bhl is from {source['timestamp_download']}")
 	# Fetch the remote timestamp from S3 Last-Modified header if downloads are enabled
 	source['timestamp_remote'] = await get_timestamp_remote(source) if settings.CHECK_FOR_DOWNLOADS else 0
 	# Log remote timestamp comparison like other datasets do
 	if not source['timestamp_remote']:
-		print(f"IMPORT : Unable to get a valid remote timestamp for bhl")
+		mesologger.warning(f"Unable to get a valid remote timestamp for bhl")
 	elif source.get('timestamp_download') and source['timestamp_remote'] == source['timestamp_download']:
-		print(f"IMPORT : Latest remote version {source['timestamp_remote']} of bhl matches local {source['timestamp_download']}")
+		mesologger.info(f"Latest remote version {source['timestamp_remote']} of bhl matches local {source['timestamp_download']}")
 	elif source.get('timestamp_download') and source['timestamp_remote'] > source['timestamp_download']:
-		print(f"IMPORT : New remote version {source['timestamp_remote']} of bhl available.")
+		mesologger.info(f"New remote version {source['timestamp_remote']} of bhl available.")
 	else:
-		print(f"IMPORT : Latest remote version of bhl is from {source['timestamp_remote']}")
+		mesologger.info(f"Latest remote version of bhl is from {source['timestamp_remote']}")
 	# Validate existing local zip isn't corrupt from a previous crashed run
 	if local and local.endswith('.zip'):
 		try:
@@ -70,7 +71,7 @@ async def update_bhl(session):
 				test.namelist()
 		except (zipfile.BadZipFile, Exception):
 			# Remove the corrupt zip so we re-download
-			print(f"IMPORT : Removing corrupt {local}")
+			mesologger.info(f"Removing corrupt {local}")
 			os.remove(f"{SRC_DIR}/{local}")
 			# Also clean up any leftover temp files from the crashed run
 			if os.path.isdir(SRC_DIR):
@@ -89,14 +90,14 @@ async def update_bhl(session):
 		datehash = source['timestamp_remote']
 		# Target zip path following standard naming convention
 		target = f"{SRC_DIR}/bhl.{datehash}.zip"
-		print(f"IMPORT : Assembling BHL zip from S3 open data bucket...")
+		mesologger.info(f"Assembling BHL zip from S3 open data bucket...")
 		# Create zip with same Data/ prefix structure as the old biodiversitylibrary.org download
 		with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as zf:
 			# Open a long-lived session for all 5 file downloads
 			async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as dl:
 				# Download each of the 5 TSV files we need
 				for filename in BHL_FILES:
-					print(f"IMPORT : Downloading {filename}.gz from S3...")
+					mesologger.info(f"Downloading {filename}.gz from S3...")
 					# Build a temp path next to the target zip for the compressed download
 					gz_path = f"{target}.{filename}.tmp"
 					# Fetch the gzipped file from S3
@@ -117,7 +118,7 @@ async def update_bhl(session):
 								dest.write(chunk)
 					# Clean up the temp gz file after it's been added to the zip
 					os.remove(gz_path)
-					print(f"IMPORT : Added Data/{filename}")
+					mesologger.info(f"Added Data/{filename}")
 		# Point the source dict at the newly created zip
 		source['latest_download'] = f"bhl.{datehash}.zip"
 		# Store the local processing path for this run
@@ -128,7 +129,7 @@ async def update_bhl(session):
 		if storage.is_s3() and settings.DOWNLOAD_ONLY and os.path.isfile(target): os.remove(target)
 		# Store the download timestamp for processed-file comparison
 		source['timestamp_download'] = datehash
-		print(f"IMPORT : Built {target}")
+		mesologger.info(f"Built {target}")
 	# Look up the latest processed parquet to see if reprocessing is needed
 	processed = get_file(source['name'])
 	# Store processed file info on source dict so package_release can find it
@@ -148,7 +149,7 @@ async def update_bhl(session):
     
 # Process a fresh source file
 def process_bhl(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
+	mesologger.info(f"Starting to process { source['latest_download'] }...") 
 	# Resolve local source path (already ensured in update_bhl for S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -175,7 +176,7 @@ def process_bhl(source: dict):
 		# Load the initial tsv files
 		page_tsv = db.read_csv(zip.open('Data/page.txt'), parallel=True,sample_size=50000)
 		names_tsv = db.read_csv(zip.open('Data/pagename.txt'), parallel=True)
-		print("IMPORT : Opened first BHL files")
+		mesologger.info("Opened first BHL files")
 
 		# Initial table - pagename.txt has ~202M rows, reduced to ~112M by grouping per item+name+type
 		db.execute(f"""
@@ -196,7 +197,7 @@ def process_bhl(source: dict):
 			GROUP BY p.ItemID, n.NameConfirmed, p.PageTypeName
 			{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 		""")
-		print(f"IMPORT : Created base table with {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} name mentions from BHL")
+		mesologger.info(f"Created base table with {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} name mentions from BHL")
 
 		# Backfill missing years from item.txt (page.txt year is often null)
 		item_tsv = db.read_csv(zip.open('Data/item.txt'), parallel=True)
@@ -206,16 +207,16 @@ def process_bhl(source: dict):
 			UPDATE bhl b SET year = i.Year, title_id = i.TitleID
 			FROM item_tsv i WHERE b.year IS NULL and i.Year IS NOT NULL AND b.item_id = i.ItemID;
 		""")
-		print(f"IMPORT : Added missing years from item.txt")
+		mesologger.info(f"Added missing years from item.txt")
 		# Mentions without any year are useless for timeline, drop them
 		db.execute(f"DELETE FROM bhl WHERE year IS NULL;")
-		print(f"IMPORT : Reduced BHL to {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} rows after removing mentions without year")
+		mesologger.info(f"Reduced BHL to {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} rows after removing mentions without year")
 		# Backfill title_id for rows that already had a year from page.txt
 		db.execute(f"""
 			UPDATE bhl b SET title_id = i.TitleID
 			FROM item_tsv i WHERE b.title_id IS NULL AND b.item_id = i.ItemID;
 		""")
-		print(f"IMPORT : Added remaining Item IDs")
+		mesologger.info(f"Added remaining Item IDs")
 
 		# Mark publications in eastern languages for separate first-mention tracking, ~8% of rows
 		titles_tsv = db.read_csv(zip.open('Data/title.txt'), parallel=True)
@@ -225,7 +226,7 @@ def process_bhl(source: dict):
 			SET eastern = (t.LanguageCode IN ('CHI', 'JPN', 'ARA', 'HEB', 'OTA', 'URD', 'PER', 'SAN', 'GUJ', 'HIN', 'IND'))
 			FROM titles_tsv t WHERE b.title_id = t.TitleID;
 		""")
-		print("IMPORT : Identified Eastern literature in BHL")
+		mesologger.info("Identified Eastern literature in BHL")
 		# Find the earliest page for each name in 4 categories, used for history timeline in distill
 		db.execute("""
 			CREATE TEMP TABLE first_mentions AS
@@ -255,19 +256,19 @@ def process_bhl(source: dict):
 			FROM (SELECT * FROM bhl WHERE year IS NOT NULL AND type = 'Illustration' AND eastern = TRUE ORDER BY year, id_raw) sorted 
 			GROUP BY name_clean;
 		""")
-		print(f"IMPORT : Found {db.execute('SELECT COUNT(*) FROM first_mentions').fetchone()[0]:,} first mentions in BHL")
+		mesologger.info(f"Found {db.execute('SELECT COUNT(*) FROM first_mentions').fetchone()[0]:,} first mentions in BHL")
 
 		# Update the mention_types in the main table using a direct join
 		db.execute("""
 			ALTER TABLE bhl ADD COLUMN IF NOT EXISTS mention_type mention_type_enum;
 			UPDATE bhl SET mention_type = fm.mention_type FROM first_mentions fm WHERE bhl.id_raw = fm.id_raw AND bhl.name_clean = fm.name_clean;
 		""")
-		print(f"IMPORT : Added first mentions to main BHL table")
+		mesologger.info(f"Added first mentions to main BHL table")
 		db.execute("DROP TABLE first_mentions;")
 
 		# Drop all non-first-mention rows — reduces ~112M to ~5.6M for the final output
 		db.execute(f"DELETE FROM bhl WHERE mention_type IS NULL;")
-		print(f"IMPORT : Reduced BHL to {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} rows after removing non-first mentions")
+		mesologger.info(f"Reduced BHL to {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} rows after removing non-first mentions")
 
 		# Do our standard cleanup, hybrids first
 		find_hybrids(db,source)
@@ -287,7 +288,7 @@ def process_bhl(source: dict):
 			);
 			DROP TABLE rows_to_keep;
 		""")
-		print(f"IMPORT : Removed final duplicates from BHL")
+		mesologger.info(f"Removed final duplicates from BHL")
 
 		# Add publication title from title.txt, prefer ShortTitle, max 100 chars
 		db.execute("""
@@ -295,7 +296,7 @@ def process_bhl(source: dict):
 			UPDATE bhl SET title = substring(COALESCE(t.ShortTitle, t.FullTitle),1,100)
 			FROM titles_tsv t WHERE bhl.title_id = t.TitleID;
 		""")
-		print(f"IMPORT : Added Book/Journal Titles to BHL data")
+		mesologger.info(f"Added Book/Journal Titles to BHL data")
 		# Aggregate creator names per title, ~91% of final rows get authors
 		creator_tsv = db.read_csv(zip.open('Data/creator.txt'), parallel=True)
 		db.execute("""
@@ -307,10 +308,10 @@ def process_bhl(source: dict):
 			UPDATE bhl SET author_raw = author_lookup.authors
 			FROM author_lookup WHERE bhl.title_id = author_lookup.TitleID;
 		""")
-		print(f"IMPORT : Added BHL authors")
+		mesologger.info(f"Added BHL authors")
 		
 		# Log
-		print(f"IMPORT : Loaded & enriched {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} name mentions from { source['name'] } tsv")
+		mesologger.info(f"Loaded & enriched {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} name mentions from { source['name'] } tsv")
 		if settings.VERBOSE:
 			db.sql(f"SELECT * FROM bhl WHERE mention_type = 'first_eastern'").show(max_rows=100)
 			db.sql(f"DESCRIBE bhl").show(max_rows=20)		

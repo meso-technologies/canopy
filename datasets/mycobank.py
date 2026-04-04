@@ -14,6 +14,7 @@ source = {
 }
 
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -26,7 +27,7 @@ from ..utils.queries import name_cleanup, find_hybrids, build_rank_and_status, v
 
 # Main function called as asyncio Task from run.py
 async def update_mycobank(session):
-	print(f"IMPORT : ############### Updating Mycobank ###############")
+	mesologger.info(f"############### Updating Mycobank ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_mycobank(source)
@@ -42,10 +43,10 @@ def process_mycobank(source: dict):
 		# Resolve local source path (already ensured by fetch in S3 mode)
 		source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 		zipfile.ZipFile(source_path).extractall(TMP_DIR) 
-		print(f"IMPORT : Unzipped Mycobank xlsx to {TMP_DIR}")
+		mesologger.info(f"Unzipped Mycobank xlsx to {TMP_DIR}")
 		# Next step, duckdb doesn't support read_xlsx() in Python yet
 		db.execute(f"""CREATE TABLE mb_raw AS SELECT * FROM read_xlsx('{TMP_DIR}/MBList.xlsx');""")
-		print(f"IMPORT : {TMP_DIR}/MBList.xlsx ingested")
+		mesologger.info(f"{TMP_DIR}/MBList.xlsx ingested")
 		# Copy to actual table
 		db.execute(f"""
 			CREATE TABLE mycobank AS SELECT 
@@ -64,7 +65,7 @@ def process_mycobank(source: dict):
 			 	"MycoBank #" AS fungorum_id
 			FROM mb_raw
 		""")
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} fungi from { source['name'] }")	
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} fungi from { source['name'] }")	
 		# db.sql("SUMMARIZE mb_raw").show(max_rows=100)
 		# db.sql("SELECT Classification FROM mb_raw").show(max_rows=100)
 		# db.sql(f"""SELECT DISTINCT "Classification", COUNT("Classification") FROM mb_raw GROUP BY "Classification" ORDER BY COUNT("Classification") DESC""").show(max_rows=30)

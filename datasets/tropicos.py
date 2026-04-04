@@ -13,6 +13,7 @@
 #		TODO: Extract typeStatus from occurrence data
 #
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # Get latest version
@@ -40,7 +41,7 @@ sources = [{
 }]
 
 async def update_tropicos(session):
-	print(f"IMPORT : ############### Starting Tropicos Update  ###############")
+	mesologger.info(f"############### Starting Tropicos Update  ###############")
 	# Fetch timestamp as server doesn't provide Last-Modified header
 	await get_tropicos_timestamp(session, sources)
 	# Manually get latest unified processed file timestamp
@@ -65,7 +66,7 @@ async def update_tropicos(session):
 
 # Process both Tropicos files
 def process_tropicos(sources: dict):
-	print(f"IMPORT : Starting to process { sources[0]['latest_download'] } and { sources[1]['latest_download'] }...")  
+	mesologger.info(f"Starting to process { sources[0]['latest_download'] } and { sources[1]['latest_download'] }...")  
 	# Load duckdb
 	with duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
@@ -79,7 +80,7 @@ def process_tropicos(sources: dict):
 		# Load occurence.txts into DuckDB
 		specimen_tsv = db.read_csv(specimen.open('occurrence.txt'),parallel=True)
 		nonmo_tsv = db.read_csv(nonmo.open('occurrence.txt'),parallel=True)
-		print(f"IMPORT : Unpacked Tropicos archives")
+		mesologger.info(f"Unpacked Tropicos archives")
 		# Merge both archives (specimen + non-MO), dedup by taxonID keeping earliest year
 		# ~301k rows after dedup. 96% have authors, 93% have year
 		db.execute(f"""
@@ -121,7 +122,7 @@ def process_tropicos(sources: dict):
 		) combined_data
 		""")
 		# Log
-		print(f"IMPORT : Loaded { db.execute('SELECT COUNT(*) FROM tropicos').fetchone()[0] } plant names from Tropicos")
+		mesologger.info(f"Loaded { db.execute('SELECT COUNT(*) FROM tropicos').fetchone()[0] } plant names from Tropicos")
 		# Rewrite sources
 		source = sources[0]
 		source['name'] = 'tropicos'
@@ -180,4 +181,4 @@ async def get_tropicos_timestamp(session: aiohttp.ClientSession, sources: dict):
             sources[0]['timestamp_remote'] = int(data[0].get('lastPublished').replace("-", ""))
             sources[1]['timestamp_remote'] = int(data[1].get('lastPublished').replace("-", ""))   
     except aiohttp.ClientError as e:
-        print(f"IMPORT : Error fetching Tropicos timestamp: {e}")
+        mesologger.error(f"Error fetching Tropicos timestamp: {e}")

@@ -13,6 +13,7 @@
 #		TODO: Import tropicosId properly, check tplID usage
 #
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -33,7 +34,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_wfo(session):
-	print(f"IMPORT : ############### Starting World Flora Online Update  ###############")
+	mesologger.info(f"############### Starting World Flora Online Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_wfo(source)
@@ -42,7 +43,7 @@ async def update_wfo(session):
     
 # Process a fresh source file
 def process_wfo(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
+	mesologger.info(f"Starting to process { source['latest_download'] }...") 
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -52,7 +53,7 @@ def process_wfo(source: dict):
 		# Load the initial tsv files
 		taxa_csv = db.read_csv(zip.open('classification.csv'),parallel=True, ignore_errors=True)
 		reference_csv = db.read_csv(zip.open('references.csv'),parallel=True)
-		print(f"IMPORT : Extracted contents of WFO archive zip")
+		mesologger.info(f"Extracted contents of WFO archive zip")
 		# Create merged table by selecting all fields we're interested and create placeholders for further data
 		db.execute(f"""
 			CREATE TABLE wfo AS 
@@ -96,7 +97,7 @@ def process_wfo(source: dict):
 		# db.sql(f"""SELECT DISTINCT  list_distinct(list(doNotProcess_reason)), COUNT(doNotProcess_reason) FROM taxa_csv WHERE NOT starts_with(doNotProcess_reason,'Duplicate of wfo-') GROUP BY doNotProcess_reason ORDER BY COUNT(doNotProcess_reason) DESC""").show(max_rows=75)
 		# db.sql("SELECT scientificName FROM taxa_csv WHERE NOT starts_with(doNotProcess_reason, 'Duplicate of wfo-')").show(max_rows=200)
 		# Log
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} entries from { source['name'] } csv")
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} entries from { source['name'] } csv")
 		# Remove ranks
 		strip_rank_from_name(db,source)  
 		# Find hybrids
@@ -131,6 +132,6 @@ def wfo_external_ids(db: duckdb.DuckDBPyConnection, source: dict):
 # WFO data quality: delete #NAME? Excel errors and #VALUE! author artifacts
 def wfo_cleanup(db: duckdb.DuckDBPyConnection, source: dict):
 	broken_names = len(db.execute("DELETE FROM wfo WHERE lower(name_raw) LIKE '#name%' RETURNING 1").fetchall())
-	if broken_names > 0: print(f"""IMPORT : Deleted {broken_names} rows with name #NAME? from WFO""")
+	if broken_names > 0: mesologger.info(f"""Deleted {broken_names} rows with name #NAME? from WFO""")
 	missing_authors = len(db.execute("UPDATE wfo SET author_raw = NULL WHERE author_raw LIKE '#%' RETURNING 1").fetchall())
-	if missing_authors > 0: print(f"""IMPORT : Removed {missing_authors} authors like #VALUE! from WFO""")
+	if missing_authors > 0: mesologger.info(f"""Removed {missing_authors} authors like #VALUE! from WFO""")

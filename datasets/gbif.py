@@ -21,6 +21,7 @@ source = {
 }
 
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -33,7 +34,7 @@ from ..utils.queries import strip_author_from_name, name_cleanup, find_hybrids, 
 
 # Main function called as asyncio Task from run.py
 async def update_gbif(session):
-	print(f"IMPORT : ############### Starting GBIF Update ###############")
+	mesologger.info(f"############### Starting GBIF Update ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_gbif(source)
@@ -52,7 +53,7 @@ def process_gbif(source: dict):
 		distribution_tsv = db.read_csv(zip.open('Distribution.tsv'),parallel=True,ignore_errors=True)
 		# Source contains weirdly formatted IPNI etc links
 		description_tsv = db.read_csv(zip.open('Description.tsv'),parallel=True)
-		print(f"IMPORT : Unpacked gbif archive")
+		mesologger.info(f"Unpacked gbif archive")
 		# Build initial table
 		db.execute(f"""
 			CREATE TABLE gbif AS SELECT 
@@ -75,7 +76,7 @@ def process_gbif(source: dict):
 			WHERE kingdom IN ('Plantae','Fungi')
 		""")
 		# Log
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants & fungi from { source['name'] }")
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants & fungi from { source['name'] }")
 		# Distribution.tsv: TDWG codes or 2-letter country codes, same pattern as CoL
 		# native_to ~117k taxa (native only), regions ~601k taxa (all establishment means)
 		db.execute("""
@@ -92,7 +93,7 @@ def process_gbif(source: dict):
 			)
 			UPDATE gbif SET native_to = h.locations FROM habitats h WHERE gbif.id_raw = h.taxonID;
 		""")
-		print(f"IMPORT : Added native habitats to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE native_to IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
+		mesologger.info(f"Added native habitats to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE native_to IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
 		# Same aggregation but without native filter
 		db.execute("""
 			ALTER TABLE gbif ADD COLUMN IF NOT EXISTS regions VARCHAR[];
@@ -106,7 +107,7 @@ def process_gbif(source: dict):
 			)
 			UPDATE gbif SET regions = h.locations FROM habitats h WHERE gbif.id_raw = h.taxonID;
 		""")
-		print(f"IMPORT : Added regions to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE regions IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
+		mesologger.info(f"Added regions to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE regions IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
 		# GBIF embeds author in scientificName, strip it out
 		strip_author_from_name(db, source)
 		# GBIF appends year to author like "L., 1753" — split into year column (~4% populated)

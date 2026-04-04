@@ -1,4 +1,5 @@
 # Load async helper for running blocking boto3 calls without blocking event loop
+from .log import mesologger
 import asyncio
 # Load JSON helpers for manifest read/write abstraction
 import json
@@ -447,12 +448,213 @@ class S3Storage:
 		# Keep TLS on for https endpoints
 		db.execute(f"SET s3_use_ssl = {'true' if self.use_ssl else 'false'};")
 
+	# Stream remote HTTP response directly into S3 multipart upload with ranged parallel workers
+	async def stream_to_s3_parallel(self, url, key, session, parallel):
+		# Normalize remote key for S3 API calls
+		object_key = key.replace('\\', '/')
+		# Clamp worker count to a sane minimum
+		worker_count = max(1, int(parallel or 1))
+		# Pick target multipart part size to keep part count manageable
+		target_part_size = 64 * 1024 * 1024
+		# Log every 512MB to keep journals concise for very large files
+		log_step_bytes = 512 * 1024 * 1024
+		# Resolve source metadata for ranged download eligibility
+		content_length = 0
+		# Track whether remote server advertises byte-range support
+		supports_ranges = False
+		# Probe remote headers before starting multipart upload
+		try:
+			# Request response headers for content length and range support
+			async with session.head(url, ssl=ssl.SSLContext()) as head_response:
+				# Raise when HEAD request failed
+				head_response.raise_for_status()
+				# Parse remote content length for fixed range partitioning
+				content_length = int(head_response.headers.get('Content-Length', '0') or 0)
+				# Parse Accept-Ranges header and detect byte-range support
+				supports_ranges = 'bytes' in str(head_response.headers.get('Accept-Ranges', '')).lower()
+		# Fall back to single-stream mode when HEAD probe fails
+		except Exception:
+			# Keep fallback values so caller uses non-ranged stream path
+			content_length = 0
+			# Mark range support unavailable when probe failed
+			supports_ranges = False
+		# Fall back to single-stream upload when range mode is not viable
+		if worker_count <= 1 or content_length <= 0 or not supports_ranges:
+			# Use buffered single-stream multipart uploader as compatibility path
+			await self.stream_to_s3(url, key, session)
+			# Return after compatibility fallback
+			return
+		# Compute number of multipart parts from full content length
+		part_count = (content_length + target_part_size - 1) // target_part_size
+		# Track uploaded part descriptors by part number
+		part_etags = {}
+		# Track uploaded payload bytes for progress logging
+		total_uploaded_bytes = 0
+		# Track next byte threshold for emitting progress logs
+		next_log_threshold = log_step_bytes
+		# Track start time for average throughput calculations
+		start_time = time.monotonic()
+		# Track next unassigned part number across worker coroutines
+		next_part_number = 1
+		# Protect part assignment and progress counters between workers
+		assignment_lock = asyncio.Lock()
+		# Protect progress counters and etag map updates between workers
+		progress_lock = asyncio.Lock()
+		# Start multipart upload and capture upload id
+		create = await asyncio.to_thread(self.s3.create_multipart_upload, Bucket=self.bucket, Key=object_key)
+		upload_id = create['UploadId']
+		# Log start of ranged multipart upload mode
+		mesologger.info(f"Streaming {url} to s3://{self.bucket}/{object_key} using {worker_count} ranged workers")
+		# Worker coroutine uploads one or more assigned parts
+		async def worker(worker_index):
+			# Stagger worker startup to reduce initial burst throttling on range requests
+			if worker_index > 0: await asyncio.sleep(worker_index * 2.5)
+			# Access shared assignment and progress state from outer scope
+			nonlocal next_part_number, total_uploaded_bytes, next_log_threshold
+			# Keep consuming parts until all ranges were uploaded
+			while True:
+				# Assign next part number atomically across workers
+				async with assignment_lock:
+					# Stop worker when all parts were already assigned
+					if next_part_number > part_count: return
+					# Reserve one part number for this worker iteration
+					part_number = next_part_number
+					# Increment shared part cursor for next assignment
+					next_part_number += 1
+				# Compute inclusive byte range for this part number
+				byte_start = (part_number - 1) * target_part_size
+				# Compute inclusive byte end capped to final payload byte
+				byte_end = min(content_length - 1, byte_start + target_part_size - 1)
+				# Build expected payload length for integrity checks
+				expected_bytes = byte_end - byte_start + 1
+				# Build HTTP range header for this part
+				range_header = {'Range': f'bytes={byte_start}-{byte_end}'}
+				# Retry transient range/download/upload failures per part
+				for attempt in range(5):
+					# Track whether this part hit repeated upstream 503 responses
+					had_503 = False
+					try:
+						# Fetch one ranged payload segment from upstream source
+						async with session.get(url, headers=range_header, ssl=ssl.SSLContext()) as response:
+							# Flag transient upstream throttling for targeted backoff and fallback
+							if response.status == 503:
+								had_503 = True
+								raise RuntimeError(f'Unexpected range status {response.status} for part {part_number}')
+							# Abort on other unexpected response codes
+							if response.status not in [200, 206]: raise RuntimeError(f'Unexpected range status {response.status} for part {part_number}')
+							# Guard against full-file responses on non-first parts
+							if response.status == 200 and (byte_start != 0 or byte_end != content_length - 1): raise RuntimeError(f'Server ignored range for part {part_number}')
+							# Read entire part payload into memory for upload
+							payload = await response.read()
+						# Guard against short or oversized part payloads
+						if len(payload) != expected_bytes: raise RuntimeError(f'Range payload size mismatch for part {part_number} expected {expected_bytes} got {len(payload)}')
+						# Upload part payload to S3 multipart upload
+						upload = await asyncio.to_thread(
+							self.s3.upload_part,
+							Bucket=self.bucket,
+							Key=object_key,
+							UploadId=upload_id,
+							PartNumber=part_number,
+							Body=payload,
+						)
+						# Commit successful part metadata and progress counters
+						async with progress_lock:
+							# Store ETag by part number for ordered completion payload
+							part_etags[part_number] = upload['ETag']
+							# Add uploaded byte count to transfer progress total
+							total_uploaded_bytes += len(payload)
+							# Emit periodic throughput logs on configured intervals
+							if total_uploaded_bytes >= next_log_threshold:
+								# Compute elapsed seconds for throughput reporting
+								elapsed = max(time.monotonic() - start_time, 1e-6)
+								# Compute average MB/s since start of transfer
+								rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
+								# Log progress with uploaded bytes and committed part count
+								mesologger.info(f"Streamed {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(part_etags)} parts avg {rate_mbps:.2f}MB/s")
+								# Advance next progress threshold until above current byte count
+								while total_uploaded_bytes >= next_log_threshold: next_log_threshold += log_step_bytes
+						# Stop retry loop after successful part upload
+						break
+					# Retry with a short backoff when this attempt failed
+					except Exception:
+						# Fall back to one-off single-stream range fetch after repeated 503 throttling
+						if had_503 and attempt == 4:
+							# Log fallback path for operator visibility
+							mesologger.warning(f"Falling back to single-range fetch for part {part_number} after repeated 503 responses")
+							# Fetch this exact range without worker competition and upload once
+							async with session.get(url, headers=range_header, ssl=ssl.SSLContext()) as response:
+								# Raise when fallback response is still not usable
+								if response.status not in [200, 206]: raise RuntimeError(f'Fallback range status {response.status} for part {part_number}')
+								# Read fallback payload bytes
+								payload = await response.read()
+							# Guard fallback payload size for integrity
+							if len(payload) != expected_bytes: raise RuntimeError(f'Fallback range payload size mismatch for part {part_number} expected {expected_bytes} got {len(payload)}')
+							# Upload fallback payload part
+							upload = await asyncio.to_thread(
+								self.s3.upload_part,
+								Bucket=self.bucket,
+								Key=object_key,
+								UploadId=upload_id,
+								PartNumber=part_number,
+								Body=payload,
+							)
+							# Commit fallback part progress under lock
+							async with progress_lock:
+								# Store fallback ETag for ordered completion
+								part_etags[part_number] = upload['ETag']
+								# Add fallback payload size to progress counters
+								total_uploaded_bytes += len(payload)
+								# Emit progress logs when threshold crossed
+								if total_uploaded_bytes >= next_log_threshold:
+									# Compute elapsed seconds for throughput reporting
+									elapsed = max(time.monotonic() - start_time, 1e-6)
+									# Compute average MB/s since start of transfer
+									rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
+									# Log fallback progress and throughput summary
+									mesologger.info(f"Streamed {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(part_etags)} parts avg {rate_mbps:.2f}MB/s")
+									# Advance next log threshold above current byte count
+									while total_uploaded_bytes >= next_log_threshold: next_log_threshold += log_step_bytes
+							# Stop retry loop after successful fallback upload
+							break
+						# Raise on final failed attempt to abort whole multipart run
+						if attempt == 4: raise
+						# Sleep before retrying this part (longer when upstream returns 503)
+						if had_503: await asyncio.sleep((2 ** attempt) + 0.5)
+						# Keep short retry cadence for non-503 transient errors
+						else: await asyncio.sleep(1 + attempt)
+		try:
+			# Run all workers concurrently to fetch and upload part ranges
+			await asyncio.gather(*[worker(index) for index in range(worker_count)])
+			# Build ordered part descriptor list for multipart completion
+			parts = [{'PartNumber': number, 'ETag': part_etags[number]} for number in sorted(part_etags.keys())]
+			# Complete multipart upload after all parts succeeded
+			await asyncio.to_thread(
+				self.s3.complete_multipart_upload,
+				Bucket=self.bucket,
+				Key=object_key,
+				UploadId=upload_id,
+				MultipartUpload={'Parts': parts},
+			)
+			# Compute elapsed seconds for final completion summary
+			elapsed = max(time.monotonic() - start_time, 1e-6)
+			# Compute final average MB/s for completion summary
+			rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
+			# Log final streamed upload completion summary
+			mesologger.info(f"Stream upload complete {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(parts)} parts avg {rate_mbps:.2f}MB/s")
+		except Exception:
+			# Abort multipart upload so partial objects are not left behind
+			await asyncio.to_thread(self.s3.abort_multipart_upload, Bucket=self.bucket, Key=object_key, UploadId=upload_id)
+			# Re-raise original failure for caller handling
+			raise
+
 	# Stream remote HTTP response directly into S3 multipart upload
 	async def stream_to_s3(self, url, key, session):
 		# Normalize remote key for S3 API calls
 		object_key = key.replace('\\', '/')
-		# Pick multipart chunk size above S3 minimum part size
-		chunk_size = 16 * 1024 * 1024
+		# Pick target multipart part size to avoid tiny-fragment uploads
+		target_part_size = 64 * 1024 * 1024
+		# Read source stream in smaller chunks and aggregate into target-sized parts
+		read_chunk_size = 8 * 1024 * 1024
 		# Log every 512MB to keep journals concise for very large files
 		log_step_bytes = 512 * 1024 * 1024
 		# Track uploaded part descriptors for completion
@@ -472,38 +674,65 @@ class S3Storage:
 				# Raise for HTTP failures before uploading parts
 				response.raise_for_status()
 				# Log start of streamed multipart upload
-				print(f"IMPORT : Streaming {url} to s3://{self.bucket}/{object_key}")
+				mesologger.info(f"Streaming {url} to s3://{self.bucket}/{object_key}")
 				# Start part numbering at 1 per S3 API contract
 				part_number = 1
-				# Stream source payload in fixed-size chunks
-				async for chunk in response.content.iter_chunked(chunk_size):
+				# Keep in-memory buffer until one full multipart part is ready
+				buffer = bytearray()
+				# Stream source payload in read chunks and fill part buffer
+				async for chunk in response.content.iter_chunked(read_chunk_size):
 					# Skip empty chunks from keepalive boundaries
 					if not chunk: continue
-					# Upload one multipart segment using blocking boto3 in thread
+					# Append read chunk to multipart buffer
+					buffer.extend(chunk)
+					# Upload as many full parts as available in buffer
+					while len(buffer) >= target_part_size:
+						# Slice one full multipart part payload from buffer
+						part_payload = bytes(buffer[:target_part_size])
+						# Remove uploaded bytes from front of buffer
+						del buffer[:target_part_size]
+						# Upload one multipart segment using blocking boto3 in thread
+						upload = await asyncio.to_thread(
+							self.s3.upload_part,
+							Bucket=self.bucket,
+							Key=object_key,
+							UploadId=upload_id,
+							PartNumber=part_number,
+							Body=part_payload,
+						)
+						# Record uploaded part metadata for completion
+						parts.append({'PartNumber': part_number, 'ETag': upload['ETag']})
+						# Add current part length to uploaded byte counter
+						total_uploaded_bytes += len(part_payload)
+						# Emit periodic progress logs when threshold was reached
+						if total_uploaded_bytes >= next_log_threshold:
+							# Compute elapsed seconds for throughput reporting
+							elapsed = max(time.monotonic() - start_time, 1e-6)
+							# Compute average MB/s since start of transfer
+							rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
+							# Log streamed upload progress with part counter and throughput
+							mesologger.info(f"Streamed {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(parts)} parts avg {rate_mbps:.2f}MB/s")
+							# Move next progress threshold forward by one logging window
+							next_log_threshold += log_step_bytes
+						# Increment part number for next upload call
+						part_number += 1
+				# Upload final buffered tail as last multipart part
+				if len(buffer) > 0:
+					# Freeze remaining bytes for final part upload
+					part_payload = bytes(buffer)
+					# Upload trailing part payload
 					upload = await asyncio.to_thread(
 						self.s3.upload_part,
 						Bucket=self.bucket,
 						Key=object_key,
 						UploadId=upload_id,
 						PartNumber=part_number,
-						Body=chunk,
+						Body=part_payload,
 					)
-					# Record uploaded part metadata for completion
+					# Record uploaded final part metadata for completion
 					parts.append({'PartNumber': part_number, 'ETag': upload['ETag']})
-					# Add current chunk length to uploaded byte counter
-					total_uploaded_bytes += len(chunk)
-					# Emit periodic progress logs when threshold was reached
-					if total_uploaded_bytes >= next_log_threshold:
-						# Compute elapsed seconds for throughput reporting
-						elapsed = max(time.monotonic() - start_time, 1e-6)
-						# Compute average MB/s since start of transfer
-						rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
-						# Log streamed upload progress with part counter and throughput
-						print(f"IMPORT : Streamed {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {part_number} parts avg {rate_mbps:.2f}MB/s")
-						# Move next progress threshold forward by one logging window
-						next_log_threshold += log_step_bytes
-					# Increment part number for next upload call
-					part_number += 1
+					# Add trailing bytes to uploaded byte counter
+					total_uploaded_bytes += len(part_payload)
 			# Complete multipart upload after all chunks succeeded
 			await asyncio.to_thread(
 				self.s3.complete_multipart_upload,
@@ -517,7 +746,7 @@ class S3Storage:
 			# Compute final average MB/s for completion summary
 			rate_mbps = (total_uploaded_bytes / (1024 * 1024)) / elapsed
 			# Log final streamed upload completion summary
-			print(f"IMPORT : Stream upload complete {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(parts)} parts avg {rate_mbps:.2f}MB/s")
+			mesologger.info(f"Stream upload complete {total_uploaded_bytes // (1024 * 1024)}MB to s3://{self.bucket}/{object_key} in {len(parts)} parts avg {rate_mbps:.2f}MB/s")
 		except Exception:
 			# Abort multipart upload so partial objects are not left behind
 			await asyncio.to_thread(self.s3.abort_multipart_upload, Bucket=self.bucket, Key=object_key, UploadId=upload_id)
@@ -547,7 +776,7 @@ def create_storage():
 	if not all([bucket, endpoint, access_key, secret_key]):
 		# Emit one clear operator-facing warning for missing S3 config
 		if not _storage_warned_missing_config:
-			print('IMPORT : Please provide necessary S3 config and secrets to use S3 mode')
+			mesologger.info('Please provide necessary S3 config and secrets to use S3 mode')
 			_storage_warned_missing_config = True
 		# Keep pipeline functional by falling back to local storage
 		return LocalStorage()

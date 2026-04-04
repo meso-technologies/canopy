@@ -2,6 +2,7 @@
 #		Wikispecies Data
 #
 
+from ..utils.log import mesologger
 from ..utils.filehandlers import fetch
 
 # Name and default URL
@@ -17,7 +18,7 @@ sources = [{
 }]
 
 async def update_wikispecies(session):
-	print(f"IMPORT : ############### Starting Wikispecies Update  ###############")
+	mesologger.info(f"############### Starting Wikispecies Update  ###############")
 	# Multiple files needed
 	for source in sources:
 		# See if we have a new remote version vs. our latest processed

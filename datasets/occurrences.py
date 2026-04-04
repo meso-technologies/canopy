@@ -8,6 +8,7 @@
 #		TODO: Add eventdate as first observation signal alongside BHL first mention
 #
 # Basics
+from ..utils.log import mesologger
 import os, io, aiohttp, json, asyncio
 from datetime import datetime, timezone, timedelta
 # Internal
@@ -40,22 +41,22 @@ async def update_occurrences():
 	if not settings.GBIF_USER or not settings.GBIF_PASSWORD:
 		# Soft-skip when we already have a local occurrence baseline
 		if storage.exists(file):
-			print('IMPORT : GBIF credentials missing, skipping occurrence update and reusing local occurrences.parquet')
+			mesologger.info('GBIF credentials missing, skipping occurrence update and reusing local occurrences.parquet')
 			return
 		# Hard-stop bootstrap when there is no local baseline at all
-		print('IMPORT : GBIF credentials missing, skipping occurrence bootstrap')
-		print('IMPORT : Register credentials at https://www.gbif.org/user/profile and set them in canopy/secrets.py')
+		mesologger.info('GBIF credentials missing, skipping occurrence bootstrap')
+		mesologger.info('Register credentials at https://www.gbif.org/user/profile and set them in canopy/secrets.py')
 		raise RuntimeError('No local GBIF occurrences.parquet and no GBIF credentials available')
 	# Bootstrap when no processed occurrence parquet exists yet
 	if not storage.exists(file):
 		# Log bootstrap path
-		print(f"IMPORT : No processed GBIF occurrence dataset found")
+		mesologger.info(f"No processed GBIF occurrence dataset found")
 		# Reuse already downloaded bootstrap zip only when it is valid
 		bootstrap_zip = os.path.join(TMP_DIR, 'occurrences.zip')
 		if os.path.isfile(bootstrap_zip):
 			# Ignore stale/corrupt bootstrap zips from interrupted downloads
 			if not is_valid_zip(bootstrap_zip):
-				print('IMPORT : Existing occurrences.zip is invalid, deleting and re-downloading')
+				mesologger.info('Existing occurrences.zip is invalid, deleting and re-downloading')
 				os.remove(bootstrap_zip)
 			# Otherwise process existing bootstrap zip into geoparquet
 			else:
@@ -66,7 +67,7 @@ async def update_occurrences():
 				save_manifest(manifest)
 				return
 		# Log API bootstrap request path
-		print('IMPORT : Requesting initial GBIF occurrences export via API (plants and fungi only)')
+		mesologger.info('Requesting initial GBIF occurrences export via API (plants and fungi only)')
 		# Get auth for entire session
 		auth = BasicAuth(settings.GBIF_USER, settings.GBIF_PASSWORD)
 		# Spawn async http session for bootstrap request polling and download
@@ -99,7 +100,7 @@ async def update_occurrences():
 		# Stop after successful bootstrap
 		return
 	# Otherwise update existing baseline incrementally
-	print(f"IMPORT : Processed GBIF occurrence data found")
+	mesologger.info(f"Processed GBIF occurrence data found")
 	# Run incremental update flow
 	await get_latest_occurrences(file)
 
@@ -120,11 +121,11 @@ async def get_latest_occurrences(file):
 		manifest = get_manifest()
 		# Soft-skip incremental updates if manifest is missing on existing local baseline
 		if not manifest:
-			print(f"IMPORT : No GBIF occurrence manifest found, skipping incremental update")
+			mesologger.info(f"No GBIF occurrence manifest found, skipping incremental update")
 			return
 		# Check if we have any reason to update, either because we never requested a download yet or it's older than 24h
 		if 'latest_download_request' in manifest and datetime.now(timezone.utc) - datetime.fromisoformat(manifest['latest_download_request']) <= timedelta(days=1):
-			print(f"IMPORT : Already requested occurrence update { manifest.get('current_download_key') } within the last 24 hours")
+			mesologger.info(f"Already requested occurrence update { manifest.get('current_download_key') } within the last 24 hours")
 		# Otherwise request a new dataset download
 		else: await request_update_from_gbif(session, manifest, initial=False)
 		# Check if we have a pending update that hasn't been processed yet
@@ -133,7 +134,7 @@ async def get_latest_occurrences(file):
 			url = await get_gbif_download_url(session, manifest)
 			# Soft-skip when GBIF is still preparing incremental export
 			if not url:
-				print('IMPORT : Incremental GBIF occurrence export not ready yet, will retry in next run')
+				mesologger.info('Incremental GBIF occurrence export not ready yet, will retry in next run')
 				return
 			# Set a filename for pending incremental export
 			filename = f"occurrence_update.{ manifest.get('current_download_key') }.zip"
@@ -141,7 +142,7 @@ async def get_latest_occurrences(file):
 			success = await download_pending_occurrence_file(session, url, filename, manifest)
 			# Soft-skip when file is still not ready
 			if not success:
-				print('IMPORT : Incremental GBIF occurrence export file not ready yet, will retry in next run')
+				mesologger.info('Incremental GBIF occurrence export file not ready yet, will retry in next run')
 				return
 			# Process successful incremental zip into rolling geoparquet
 			process_incremental_update(manifest, filename)
@@ -149,7 +150,7 @@ async def get_latest_occurrences(file):
 # Start a new GBIF batch job
 async def request_update_from_gbif(session, manifest, initial=False):
 	# Log request mode
-	print(f"IMPORT : Requesting {'initial' if initial else 'latest'} occurrences from GBIF...")
+	mesologger.info(f"Requesting {'initial' if initial else 'latest'} occurrences from GBIF...")
 	# Build shared predicate base for both initial and incremental runs
 	predicates = [
 		{
@@ -182,7 +183,7 @@ async def request_update_from_gbif(session, manifest, initial=False):
 		timestamp = manifest.get('latest_download') or manifest.get('initial_download')
 		# Skip incremental request when no baseline timestamp exists
 		if not timestamp:
-			print('IMPORT : No occurrence baseline timestamp in manifest, skipping incremental request')
+			mesologger.info('No occurrence baseline timestamp in manifest, skipping incremental request')
 			return
 		# Prepend modified cutoff for incremental delta request
 		predicates.insert(0, {
@@ -204,7 +205,7 @@ async def request_update_from_gbif(session, manifest, initial=False):
 	async with session.post(GBIF_API_HOST + 'occurrence/download/request', json=request_body) as resp:
 		# Log and stop when GBIF rejects request creation
 		if resp.status != 201:
-			print(f"IMPORT : { resp.status } error requesting {'initial' if initial else 'latest'} GBIF occurrences: { await resp.text() }")
+			mesologger.error(f"{ resp.status } error requesting {'initial' if initial else 'latest'} GBIF occurrences: { await resp.text() }")
 			return
 		# Remember pending request key
 		current_download_key = await resp.text()
@@ -212,7 +213,7 @@ async def request_update_from_gbif(session, manifest, initial=False):
 		manifest['latest_download_request'] = datetime.now(timezone.utc).isoformat()
 		save_manifest(manifest)
 		# Log success
-		print(f"IMPORT : Successfully requested dataset creation { current_download_key } with {'initial' if initial else 'latest'} occurrences from GBIF")
+		mesologger.info(f"Successfully requested dataset creation { current_download_key } with {'initial' if initial else 'latest'} occurrences from GBIF")
 
 # See if GBIF spawned a URL from which we eventually can download the data
 async def get_gbif_download_url(session,manifest):
@@ -220,10 +221,10 @@ async def get_gbif_download_url(session,manifest):
 	pending_id = manifest.get('current_download_key')
 	# Sanity
 	if not pending_id:
-		print(f"IMPORT : ERROR No pending update id found")
+		mesologger.error(f"ERROR No pending update id found")
 		return	
 	# Log
-	print(f"IMPORT : Fetching pending GBIF occurrence update {pending_id}")
+	mesologger.info(f"Fetching pending GBIF occurrence update {pending_id}")
 	# Give it 15 minutes
 	end_time = datetime.now() + timedelta(minutes=10)
 	# Start iterating
@@ -234,18 +235,18 @@ async def get_gbif_download_url(session,manifest):
 				# If we get a 302 response and update URL
 				if response.status == 302 and response.headers.get("Location"): return response.headers.get("Location")
 				# Otherwise check if GBIF is trying to tell us something
-				elif response.status == 200: print(f"IMPORT : GBIF incremental update status is {await response.text()}")
+				elif response.status == 200: mesologger.info(f"GBIF incremental update status is {await response.text()}")
 				# If download was cancelled, is expired etc
 				else: 
 					# Log
-					print(f"IMPORT : GBIF incremental update invalid {await response.text()}")
+					mesologger.info(f"GBIF incremental update invalid {await response.text()}")
 					# Reset manifest
 					manifest.pop('current_download_key', None)
 					# Stop here
 					return
-		except Exception as e: print(f"IMPORT : Error trying to retrieve GBIF incremental update {pending_id}: {e}")
+		except Exception as e: mesologger.error(f"Error trying to retrieve GBIF incremental update {pending_id}: {e}")
 		# Show progress
-		print(f"IMPORT : Update not yet ready, trying again in {GBIF_RETRY_SECONDS} seconds...")
+		mesologger.info(f"Update not yet ready, trying again in {GBIF_RETRY_SECONDS} seconds...")
 		# Wait before next request
 		await asyncio.sleep(GBIF_RETRY_SECONDS)
 
@@ -280,11 +281,11 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 				if content_length and int(content_length) > 1000: break
 		# Wait unless this was final retry
 		if attempt < (GBIF_FILE_READY_ATTEMPTS - 1):
-			print(f"IMPORT : File not ready, checking again in {GBIF_RETRY_SECONDS} seconds...")
+			mesologger.info(f"File not ready, checking again in {GBIF_RETRY_SECONDS} seconds...")
 			await asyncio.sleep(GBIF_RETRY_SECONDS)
 	# Stop when file was never ready within wait window
 	else:
-		print(f"IMPORT : File still not ready after 20 minutes")
+		mesologger.info(f"File still not ready after 20 minutes")
 		return False
 	# Wait for GBIF to report a stable file size before downloading
 	expected_size = 0
@@ -298,36 +299,36 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 			else: current_size = 0
 		# Skip invalid/empty size responses
 		if current_size <= 1000:
-			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
+			mesologger.info(f"GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
 			await asyncio.sleep(GBIF_RETRY_SECONDS)
 			continue
 		# Confirm delayed verification check if we previously saw matching sizes
 		if verify_after_delay:
 			# Proceed only if size remained unchanged after the longer wait
 			if current_size == expected_size:
-				print(f"IMPORT : GBIF reports stable size {expected_size:,} bytes for {filename}")
+				mesologger.info(f"GBIF reports stable size {expected_size:,} bytes for {filename}")
 				break
 			# Reset verification state when size changed again
 			verify_after_delay = False
 			expected_size = current_size
-			print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
+			mesologger.info(f"GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
 			await asyncio.sleep(GBIF_RETRY_SECONDS)
 			continue
 		# First matching check: pause briefly before final confirmation
 		if current_size == expected_size:
-			print(f"IMPORT : GBIF zip looks complete, waiting {GBIF_RETRY_SECONDS} secs to verify...")
+			mesologger.info(f"GBIF zip looks complete, waiting {GBIF_RETRY_SECONDS} secs to verify...")
 			verify_after_delay = True
 			await asyncio.sleep(GBIF_RETRY_SECONDS)
 			continue
 		# Track latest size and keep polling
 		expected_size = current_size
-		print(f"IMPORT : GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
+		mesologger.info(f"GBIF still adding to zip (currently {current_size / (1024**3):.1f}GB), retrying in {GBIF_RETRY_SECONDS} secs...")
 		await asyncio.sleep(GBIF_RETRY_SECONDS)
 	# Download the file via aria
 	success = await aria_download(filename, url, 4, TMP_DIR)
 	# Treat invalid/corrupt zip as unsuccessful download
 	if success and not is_valid_zip(filepath):
-		print('IMPORT : Download completed but zip validation failed, will retry later')
+		mesologger.warning('Download completed but zip validation failed, will retry later')
 		return False
 	# Persist latest successful download timestamp
 	if success:
@@ -378,15 +379,15 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 		""")
 		# Log, but query only every 10 files
 		if counter % 10 == 0 or counter == 1: occurrence_count = db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
-		print(f"\rIMPORT : Extracted {occurrence_count:,} occurrences from {counter} of {total} files",end="")
+		mesologger.info(f"Extracted {occurrence_count:,} occurrences from {counter} of {total} files", extra={'sameline': True})
 		# Iterate 
 		counter += 1
 	# Refresh final extracted count for accurate end-of-stage logging
 	occurrence_count = db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
 	# Print final extraction summary on the same carriage-return line as progress output
-	print(f"\rIMPORT : Successfully extracted {occurrence_count:,} occurrences from {total} files".ljust(96), end="")
+	mesologger.info(f"Successfully extracted {occurrence_count:,} occurrences from {total} files".ljust(96), extra={'sameline': True})
 	# Finish progress line with newline
-	print()
+	
 
 # Apply incremental GBIF download: merge new/updated occurrences into existing parquet
 def process_incremental_update(manifest,filename):
@@ -397,7 +398,7 @@ def process_incremental_update(manifest,filename):
 		# Check if we even have any new occurrences
 		new_occurrences = db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
 		if not new_occurrences or new_occurrences == 0:
-			print(f"IMPORT : No new occurrences in incremental update")		
+			mesologger.info(f"No new occurrences in incremental update")		
 		# Otherwise process them	
 		else:
 			db.execute(f"SET temp_directory = '{ TMP_DIR }'")
@@ -411,7 +412,7 @@ def process_incremental_update(manifest,filename):
 				CREATE TABLE existing_occurrences AS SELECT * FROM existing_occurrence_parquet;
 			""")	
 			count = db.execute("SELECT COUNT(*) FROM existing_occurrences").fetchone()[0]
-			print(f"IMPORT : Loaded {count:,} occurrences from existing {os.path.join(GEO_DIR,'occurrences.parquet')}")
+			mesologger.info(f"Loaded {count:,} occurrences from existing {os.path.join(GEO_DIR,'occurrences.parquet')}")
 			# Count incoming rows that match existing occurrence ids
 			updated_count = db.execute("""
 				SELECT COUNT(*)
@@ -428,28 +429,28 @@ def process_incremental_update(manifest,filename):
 				FROM occurrences WHERE existing_occurrences.id = occurrences.id;
 			""")
 			# Log how many incoming occurrences mapped to existing ids
-			print(f"IMPORT : Updated {updated_count:,} existing occurrences")
+			mesologger.info(f"Updated {updated_count:,} existing occurrences")
 			# Insert occurrences not already in existing set
 			db.execute("""
 				INSERT INTO existing_occurrences SELECT * FROM occurrences AS source
 				WHERE NOT EXISTS (SELECT 1 FROM existing_occurrences AS target WHERE target.id = source.id);
 			""")
-			print(f"IMPORT : Added {db.execute("SELECT COUNT(*) FROM existing_occurrences").fetchone()[0]-count:,} new occurrences")
+			mesologger.info(f"Added {db.execute("SELECT COUNT(*) FROM existing_occurrences").fetchone()[0]-count:,} new occurrences")
 			# Check data
 			if settings.VERBOSE: db.sql("SELECT * FROM occurrences").show(max_rows=200)
 			# Write to disc using COPY as write_parquet() doesn't do geoparquet well
 			db.sql(f"""COPY existing_occurrences TO '{os.path.join(GEO_DIR, "occurrences.parquet")}';""")
 			# Upload refreshed rolling occurrence parquet to S3 when backend is active
 			if storage.is_s3(): storage.upload(os.path.join(GEO_DIR, 'occurrences.parquet'))
-			print(f"IMPORT : Wrote updated occurrences.parquet to {GEO_DIR}")
+			mesologger.info(f"Wrote updated occurrences.parquet to {GEO_DIR}")
 		# Update manifest
 		manifest['last_processed_download_key'] =  manifest.get('current_download_key')
 		save_manifest(manifest)
-		print(f"IMPORT : Updated manifest, occurrence update complete")
+		mesologger.info(f"Updated manifest, occurrence update complete")
 
 # Initial bootstrap: extract full GBIF occurrence snapshot (~200GB zip) into geoparquet
 def distill_occurrences():		
-	print(f"IMPORT : ############### Processing GBIF occurrences ###############")
+	mesologger.info(f"############### Processing GBIF occurrences ###############")
 	# Pointer to zip and spawn db
 	with zipfile.ZipFile(os.path.join(TMP_DIR, f"occurrences.zip"), 'r') as zip, duckdb.connect(':memory:') as db:
 		# Use shared function
@@ -458,7 +459,7 @@ def distill_occurrences():
 		db.sql(f"""COPY occurrences TO '{os.path.join(GEO_DIR, "occurrences.parquet")}';""")
 		# Upload freshly distilled rolling occurrence parquet to S3 when backend is active
 		if storage.is_s3(): storage.upload(os.path.join(GEO_DIR, 'occurrences.parquet'))
-		print(f"IMPORT : Wrote occurrences.parquet to {GEO_DIR}")
+		mesologger.info(f"Wrote occurrences.parquet to {GEO_DIR}")
 
 # Load occurrence manifest (tracks download keys and processing state)
 def get_manifest() -> dict:
@@ -466,5 +467,5 @@ def get_manifest() -> dict:
 	try: 
 		return storage.read_json(os.path.join(GEO_DIR,'manifest.json'))
 	# Error logging
-	except FileNotFoundError: print(f"IMPORT : No GBIF occurrence manifest found")
-	except json.JSONDecodeError: print(f"IMPORT : GBIF occurrence manifest corrupted")	
+	except FileNotFoundError: mesologger.error(f"No GBIF occurrence manifest found")
+	except json.JSONDecodeError: mesologger.error(f"GBIF occurrence manifest corrupted")	

@@ -23,6 +23,9 @@ dependencies = [
 	"pandas"
 ]
 
+[project.optional-dependencies]
+sentry = ["sentry-sdk"]
+
 [tool.setuptools]
 package-dir = {"importer" = ".."}
 packages = ["importer.canopy", "importer.canopy.config", "importer.canopy.datasets", "importer.canopy.utils", "importer.canopy.pipeline"]

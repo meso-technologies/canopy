@@ -1,4 +1,5 @@
 # Load traceback helpers for readable failure output
+from .utils.log import mesologger, mesologger_setup
 import traceback
 # Load process exit helper for non-zero failure signaling
 import sys
@@ -46,6 +47,8 @@ async def main(argv=None):
 	parser.add_argument('--s3', action='store_true', help='Use configured S3 storage backend instead of local storage')
 	# Parse CLI args (or injected argv from wrapper)
 	args = parser.parse_args(argv)
+	# Configure canopy logger for standalone and wrapper subprocess runs
+	mesologger_setup('CANOPY')
 	# Build runtime settings class from CLI profile/flags
 	runtime = build_settings(args)
 	# Mark pure download mode so dataset handlers skip processing work
@@ -53,13 +56,13 @@ async def main(argv=None):
 	# Publish runtime settings globally for canopy modules
 	settings.set_config(runtime)
 	# Announce canopy start for long-running logs
-	print('CANOPY : Starting canopy pipeline')
+	mesologger.info('Starting canopy pipeline')
 	# Log active storage backend mode after runtime settings are initialized
-	if runtime.USE_S3 and storage.is_s3(): print('CANOPY : Using S3 as storage backend')
+	if runtime.USE_S3 and storage.is_s3(): mesologger.info('Using S3 as storage backend')
 	# Log graceful fallback when S3 was requested but config is incomplete
-	elif runtime.USE_S3 and not storage.is_s3(): print('CANOPY : S3 not available, check config/secrets and run update.sh, falling back on local storage')
+	elif runtime.USE_S3 and not storage.is_s3(): mesologger.warning('S3 not available, check config/secrets and run update.sh, falling back on local storage')
 	# Log default local backend mode
-	else: print('CANOPY : Using local storage backend')
+	else: mesologger.info('Using local storage backend')
 	# Set a shared request timeout for direct HTTP operations
 	# Full download runs can exceed 2 hours due large source throttling (for example Wikidata)
 	timeout = aiohttp.ClientTimeout(total=60 * 60 * 8)
@@ -73,8 +76,10 @@ async def main(argv=None):
 		run_processing = args.process or args.download or not any([args.fuse, args.geo, args.apis])
 		# Start dataset execution stage when requested
 		if run_processing:
+			# Build optional user-agent header set for outbound source requests
+			session_headers = {'User-Agent': settings.HTTP_USER_AGENT} if settings.HTTP_USER_AGENT else None
 			# Reuse one HTTP session across all dataset handlers
-			async with aiohttp.ClientSession(timeout=timeout) as session:
+			async with aiohttp.ClientSession(timeout=timeout, headers=session_headers) as session:
 				# Handle grouped async exceptions while keeping per-dataset tracebacks
 				try:
 					# Iterate in stable source order expected by later stages
@@ -96,7 +101,7 @@ async def main(argv=None):
 					# Guard against typos when dataset filter references unknown source names
 					if args.dataset and args.dataset not in sources:
 						# Report invalid dataset selection to the caller
-						print('CANOPY : Invalid dataset specified')
+						mesologger.error('Invalid dataset specified')
 						# Fail fast so wrapper can stop and report invalid CLI input
 						raise ValueError('Invalid dataset specified')
 				# Handle cooperative cancellation cleanly
@@ -104,17 +109,17 @@ async def main(argv=None):
 					# Mark grouped cancellation as failure for wrapper orchestration
 					had_errors = True
 					# Log cancellation reason for operator visibility
-					print('CANOPY : Tasks cancelled - shutting down...')
+					mesologger.warning('Tasks cancelled - shutting down...')
 				# Report grouped stage exceptions without losing stack traces
 				except* Exception as eg:
 					# Mark grouped dataset failures so process exits non-zero
 					had_errors = True
 					# Announce grouped dataset failures
-					print('CANOPY : Some tasks failed:')
+					mesologger.error('Some tasks failed:')
 					# Print each underlying exception from the exception group
 					for e in eg.exceptions:
 						# Emit short exception summary
-						print(f' - {type(e).__name__}: {str(e)}')
+						mesologger.error(f'- {type(e).__name__}: {str(e)}')
 						# Emit full traceback for root-cause debugging
 						traceback.print_exception(type(e), e, e.__traceback__)
 		# Exit after downloads when explicitly running download-only mode
@@ -122,7 +127,7 @@ async def main(argv=None):
 			# Mark authoritative download checkpoint only for full-source runs
 			if not args.dataset: set_checkpoint('download')
 			# Explain why follow-up stages are skipped
-			print('CANOPY : Download-only run complete, skipping process/fuse/geo/apis steps')
+			mesologger.info('Download-only run complete, skipping process/fuse/geo/apis steps')
 			# No release object is produced in download-only runs
 			return None
 		# Initialize release metadata container for downstream stages
@@ -140,17 +145,21 @@ async def main(argv=None):
 				# Mark cancellation as failure for wrapper orchestration
 				had_errors = True
 				# Confirm clean cancellation to operator logs
-				print('CANOPY : Fusion cancelled by user.')
+				mesologger.warning('Fusion cancelled by user.')
 			# Surface fusion failures with full traceback context
 			except Exception as e:
 				# Mark fusion failure so process exits non-zero
 				had_errors = True
 				# Emit concise error summary for quick scanning
-				print(f'CANOPY : Error during fusion: {type(e).__name__}: {str(e)}')
+				mesologger.error(f'Error during fusion: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
 				traceback.print_exception(type(e), e, e.__traceback__)
 		# Abort follow-up stages immediately when earlier stages failed
-		if had_errors: raise RuntimeError('Canopy stage errors detected')
+		if had_errors:
+			# Emit fatal stage summary before aborting pipeline run
+			mesologger.critical('Canopy stage errors detected')
+			# Raise to preserve non-zero process semantics
+			raise RuntimeError('Canopy stage errors detected')
 		# Run geospatial stage only when requested
 		if args.geo:
 			try:
@@ -162,7 +171,7 @@ async def main(argv=None):
 				# Mark geo failure so process exits non-zero
 				had_errors = True
 				# Emit concise error summary for quick scanning
-				print(f'CANOPY : Error during geo: {type(e).__name__}: {str(e)}')
+				mesologger.error(f'Error during geo: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
 				traceback.print_exception(type(e), e, e.__traceback__)
 		# Run API enrichment stage only when requested
@@ -176,17 +185,21 @@ async def main(argv=None):
 				# Mark API stage failure so process exits non-zero
 				had_errors = True
 				# Emit concise error summary for quick scanning
-				print(f'CANOPY : Error during apis: {type(e).__name__}: {str(e)}')
+				mesologger.error(f'Error during apis: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
 				traceback.print_exception(type(e), e, e.__traceback__)
 		# Abort with non-zero exit semantics when any stage failed
-		if had_errors: raise RuntimeError('Canopy stage errors detected')
+		if had_errors:
+			# Emit fatal stage summary before aborting pipeline run
+			mesologger.critical('Canopy stage errors detected')
+			# Raise to preserve non-zero process semantics
+			raise RuntimeError('Canopy stage errors detected')
 		# Return release metadata for wrapper orchestration and distill handoff
 		return release
 	# Catch any unhandled runtime failure in canopy flow
 	except Exception as e:
 		# Emit concise top-level failure summary
-		print(f'CANOPY : Unhandled exception {type(e).__name__}: {str(e)}')
+		mesologger.error(f'Unhandled exception {type(e).__name__}: {str(e)}')
 		# Emit full traceback for postmortem debugging
 		traceback.print_exception(type(e), e, e.__traceback__)
 		# Re-raise so CLI process exits non-zero and wrapper can stop
@@ -194,10 +207,12 @@ async def main(argv=None):
 	# Catch cancellation propagated to top-level runner
 	except asyncio.exceptions.CancelledError:
 		# Confirm cancellation in logs
-		print('CANOPY : Pipeline cancelled.')
+		mesologger.warning('Pipeline cancelled.')
 
 # Run canopy when invoked as a module script
 if __name__ == '__main__':
+	# Configure canopy logger before bootstrap logging
+	mesologger_setup('CANOPY')
 	# Wrap standalone execution with explicit shutdown/error logging
 	try:
 		# Start async canopy main coroutine
@@ -205,11 +220,11 @@ if __name__ == '__main__':
 	# Handle Ctrl+C shutdown cleanly
 	except KeyboardInterrupt:
 		# Confirm graceful stop in logs
-		print('CANOPY : Shutting down canopy...')
+		mesologger.info('Shutting down canopy...')
 	# Catch any unhandled bootstrap/runtime error in standalone mode
 	except Exception as e:
 		# Emit concise top-level error message
-		print(f'CANOPY : Unhandled error {type(e).__name__}: {e}.')
+		mesologger.error(f'Unhandled error {type(e).__name__}: {e}.')
 		# Emit stack for debugging unexpected top-level failures
 		traceback.print_stack()
 		# Exit non-zero so wrapper orchestration can stop safely

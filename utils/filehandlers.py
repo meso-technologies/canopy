@@ -1,4 +1,5 @@
 # Load filesystem helpers, timing utilities, system access, and dynamic imports
+from .log import mesologger
 import os, time, sys, importlib
 
 # Load canopy path constants and runtime settings
@@ -20,12 +21,12 @@ async def fetch(session, source: dict) -> bool:
 	if latest_download: 
 		source['latest_download'] = latest_download
 		source['timestamp_download'] = int(latest_download.split('.')[1])
-		print(f"IMPORT : Latest local version of { source['name'] } is from { source['timestamp_download'] }")
-	else: print(f"IMPORT : No local { source['name'] } version available")
+		mesologger.info(f"Latest local version of { source['name'] } is from { source['timestamp_download'] }")
+	else: mesologger.info(f"No local { source['name'] } version available")
 	# Check for remote version
 	if settings.CHECK_FOR_DOWNLOADS: 
 		# See if we have a new file successfully downloaded
-		if await pull(session, source): print(f"IMPORT : Successfully fetched new remote version of { source['name'] }.")
+		if await pull(session, source): mesologger.info(f"Successfully fetched new remote version of { source['name'] }.")
 	# Ensure source processing path is available locally for downstream zip/gzip consumers
 	if source.get('latest_download'):
 		# Build canonical source path under canopy source directory
@@ -48,7 +49,7 @@ async def fetch(session, source: dict) -> bool:
 	update_source_state(source, 'fetch')
 	# Check if we need to process
 	if not source.get('timestamp_processed') or (source.get('timestamp_download') and source.get('timestamp_processed') < source.get('timestamp_download')):
-		print(f"IMPORT : Processed { source['name']} version outdated, we have { source.get('timestamp_processed') } but { source.get('timestamp_download') } is available.")
+		mesologger.info(f"Processed { source['name']} version outdated, we have { source.get('timestamp_processed') } but { source.get('timestamp_download') } is available.")
 		# Let importer know that processing needs to be done
 		return True
 	return False
@@ -107,7 +108,7 @@ def delete_older_files(filename: str, datehash: str, dir) -> None:
 	dir = dir or SRC_DIR
 	# Prevent the most stupid mistakes
 	if len(str(dir)) < 3:
-		print(f"IMPORT : WARNING, TRIED TO DELETE FILES IN { dir }")
+		mesologger.warning(f"WARNING, TRIED TO DELETE FILES IN { dir }")
 		return
 	try:
 		for file in storage.list_files(dir, prefix=filename + '.'):
@@ -118,10 +119,10 @@ def delete_older_files(filename: str, datehash: str, dir) -> None:
 			# Compare hashes, this shouldn't be larger but lets leave it in anyway for now
 			if int(file.split('.')[1]) >= int(datehash): continue
 			# Delete if we made it all the way here
-			print(f"IMPORT : Deleting old file { dir }/{ file }")
+			mesologger.info(f"Deleting old file { dir }/{ file }")
 			storage.delete(full_path)
 	except Exception as e:
-		print(f"IMPORT : Unable to delete { filename } {type(e).__name__ } { e }.")	
+		mesologger.error(f"Unable to delete { filename } {type(e).__name__ } { e }.")	
 
 # Check whether a specific release folder exists in the target release directory
 def check_release(release,dir=None):
@@ -151,14 +152,14 @@ def get_latest_release(release_dir=None):
 				newest_release = entry
 	# If we still don't have a release
 	if not newest_release:
-		print(f"IMPORT : No release found in {release_dir}")		
+		mesologger.info(f"No release found in {release_dir}")		
 		return	
 	# Try fetching manifest
 	try: 
 		return storage.read_json(os.path.join(release_dir, newest_release, 'manifest.json'))
 	# Error logging
-	except FileNotFoundError: print(f"IMPORT : No manifest found in { newest_release }")
-	except json.JSONDecodeError: print(f"IMPORT : { newest_release } release manifest corrupted")	
+	except FileNotFoundError: mesologger.error(f"No manifest found in { newest_release }")
+	except json.JSONDecodeError: mesologger.error(f"{ newest_release } release manifest corrupted")	
 
 # Remove stale hashed release artifacts that are no longer referenced by manifest
 def cleanup_release(dir, manifest):
@@ -166,10 +167,10 @@ def cleanup_release(dir, manifest):
 	release_dir = os.path.join(dir,manifest.get('version'))
 	# Prevent the most stupid mistakes
 	if len(str(release_dir)) < 3:
-		print(f"IMPORT : WARNING, TRIED TO DELETE FILES IN { release_dir }")
+		mesologger.warning(f"WARNING, TRIED TO DELETE FILES IN { release_dir }")
 		return
 	# Log
-	print(f"IMPORT : Cleaning up release dir {release_dir}")
+	mesologger.info(f"Cleaning up release dir {release_dir}")
 	try:
 		# Do list comprehension only once
 		current_files = [manifest[key] for key in releasefiles]
@@ -181,10 +182,10 @@ def cleanup_release(dir, manifest):
 			# Check if it's a file we actually want to keep
 			if file in current_files: continue
 			# Delete if we made it all the way here
-			print(f"IMPORT : Deleting old file { release_dir }/{ file }")
+			mesologger.info(f"Deleting old file { release_dir }/{ file }")
 			storage.delete(full_path)
 	except Exception as e:
-		print(f"IMPORT : Unable to delete file in { release_dir } {type(e).__name__ } { e }.")	
+		mesologger.error(f"Unable to delete file in { release_dir } {type(e).__name__ } { e }.")	
 
 ################## Parallel processing of very large gzip files like Wikidata from here on ###########################	
 
@@ -201,20 +202,20 @@ def get_system_resources() -> list[int, int]:
         # Get CPU count - use cpu_count() for Windows compatibility
         cores = os.cpu_count()
         memory = int(psutil.virtual_memory().total / 1024**3)
-        print(f"IMPORT : { cores} cores and { memory }GB memory available")
+        mesologger.info(f"{ cores} cores and { memory }GB memory available")
         return [cores, memory]
     except Exception as e:
-        print(f"IMPORT : Unable to detect system cores and RAM, using 8GB and 8 threads {e}")
+        mesologger.warning(f"Unable to detect system cores and RAM, using 8GB and 8 threads {e}")
         return [8,8]
 
 # Takes a gzipped file and filter criteria, splits the gzip in chunks, 
 # runs them through ripgrep and produces one output file in temp dir
 def filter_gzip(source: dict, pattern: str):
-	print(f"IMPORT : Filtering large gzip file { source['latest_download']}")
+	mesologger.info(f"Filtering large gzip file { source['latest_download']}")
 	# Sanity
 	file = source.get('local_path') or os.path.join(SRC_DIR, source['latest_download'])
 	if not os.path.isfile(file):
-		print(f"IMPORT : File not found { source['latest_download']}")	
+		mesologger.info(f"File not found { source['latest_download']}")	
 		return	
 	# Get our chunks first
 	chunks = get_gzip_chunks(file)
@@ -228,17 +229,17 @@ def filter_gzip(source: dict, pattern: str):
 			for chunk in result_files:
 				# Extract just the filtered_filename part to check if it starts with "chunk_"
 				if os.path.basename(chunk).startswith("chunk_"):
-					print(f"IMPORT : Adding { chunk } to { filtered_filename }")
+					mesologger.info(f"Adding { chunk } to { filtered_filename }")
 					try:
 						# Use the full path when opening the file
 						with open(chunk, "r") as infile: outfile.write(infile.read())
 						# Delete the chunk file
 						os.remove(chunk)
-					except Exception as e: print(f"IMPORT : Error processing {chunk}: {e}")
-		print(f"IMPORT : All { len(result_files) } chunks merged into { filtered_filename }")
+					except Exception as e: mesologger.error(f"Error processing {chunk}: {e}")
+		mesologger.info(f"All { len(result_files) } chunks merged into { filtered_filename }")
 		return filtered_filename
 	except Exception as e:
-		print(f"IMPORT : Error {e}")
+		mesologger.error(f"Error {e}")
 	
 # Split and scan gzipped file for gzip headers
 def get_gzip_chunks(file):
@@ -253,7 +254,7 @@ def get_gzip_chunks(file):
 	chunk_size = file_size // num_chunks
 	chunk_size_gb = chunk_size // 1024**3
 	# Log
-	print(f"IMPORT : Dividing { file } into { num_chunks } chunks of { chunk_size_gb }GB each")
+	mesologger.info(f"Dividing { file } into { num_chunks } chunks of { chunk_size_gb }GB each")
 	# First boundary is always 0
 	boundaries = [0]
 	start_time = time.time()
@@ -319,7 +320,7 @@ def get_gzip_chunks(file):
 					if is_valid_gzip_header(f, potential_header_pos):
 						# Add the position (offset plus index position)
 						boundaries.append(potential_header_pos)
-						print(f"IMPORT : Found valid header at position {potential_header_pos/1024/1024/1024:.2f} GB")
+						mesologger.info(f"Found valid header at position {potential_header_pos/1024/1024/1024:.2f} GB")
 						break
 					else:
 						# False positive, continue searching after this position
@@ -331,12 +332,12 @@ def get_gzip_chunks(file):
 				f.seek(header_pos)
 			# In case we haven't found anything
 			if eof:
-				print(f"IMPORT : No header found in chunk { i }, after position {header_pos/1024/1024/1024:.2f} GB")
+				mesologger.info(f"No header found in chunk { i }, after position {header_pos/1024/1024/1024:.2f} GB")
 				return False
 	# Add the file size as the last boundary
 	boundaries.append(file_size)
 	end_time = time.time()
-	print(f"IMPORT : Found all {len(boundaries)-1} chunk headers in {end_time - start_time:.2f} seconds")
+	mesologger.info(f"Found all {len(boundaries)-1} chunk headers in {end_time - start_time:.2f} seconds")
 	return boundaries
 
 # Global flag for tracking termination
@@ -376,12 +377,12 @@ def process_chunks_parallel(archive_path, chunks, pattern, max_workers=2):
 	global _terminate
 	_terminate = False
 	
-	print(f"IMPORT : Starting parallel processing with {max_workers} workers")
+	mesologger.info(f"Starting parallel processing with {max_workers} workers")
 	
 	# Set up signal handler for Ctrl+C
 	def sigint_handler(sig, frame):
 		global _terminate
-		print("IMPORT : Received Ctrl+C. Aborting all processes...")
+		mesologger.info("Received Ctrl+C. Aborting all processes...")
 		_terminate = True
 		
 		# Call cleanup immediately
@@ -461,7 +462,7 @@ def process_chunks_parallel(archive_path, chunks, pattern, max_workers=2):
 					results.append(result)
 	
 	except KeyboardInterrupt:
-		print("IMPORT : Interrupt received in main process. Terminating all workers...")
+		mesologger.info("Interrupt received in main process. Terminating all workers...")
 		_terminate = True
 		
 		# Terminate all processes
@@ -474,9 +475,9 @@ def process_chunks_parallel(archive_path, chunks, pattern, max_workers=2):
 		signal.signal(signal.SIGINT, original_sigint_handler)
 		
 		if _terminate:
-			print(f"IMPORT : Processing aborted. Processed {len(results)}/{len(chunk_args)} chunks before abort")
+			mesologger.info(f"Processing aborted. Processed {len(results)}/{len(chunk_args)} chunks before abort")
 		else:
-			print(f"IMPORT : Parallel processing complete. Processed {len(results)}/{len(chunk_args)} chunks successfully")
+			mesologger.info(f"Parallel processing complete. Processed {len(results)}/{len(chunk_args)} chunks successfully")
 	
 	return results
 
@@ -499,7 +500,7 @@ def process_chunk_wrapper(args, result_queue):
 		# Handle interrupt gracefully
 		sys.exit(0)
 	except Exception as e:
-		print(f"IMPORT : Error in worker process: {str(e)}")
+		mesologger.error(f"Error in worker process: {str(e)}")
 		result_queue.put(None)
 		sys.exit(1)
 
@@ -555,7 +556,7 @@ def process_chunk(archive_path, chunk_offset, pattern, next_chunk_offset, chunk_
 		with open(archive_path, "rb") as archive_file:
 			# Seek to the chunk offset
 			archive_file.seek(chunk_offset)
-			print(f"IMPORT : Starting to process chunk { chunk_id }")			
+			mesologger.info(f"Starting to process chunk { chunk_id }")			
 			# Read and feed data in chunks to avoid excessive memory usage
 			bytes_remaining = chunk_size
 			start_time = time.time()
@@ -590,7 +591,7 @@ def process_chunk(archive_path, chunk_offset, pattern, next_chunk_offset, chunk_
 				if current_time - last_log_time >= 1.0:
 					elapsed = current_time - start_time
 					mb_per_sec = (total_processed / 1024 / 1024) / elapsed if elapsed > 0 else 0					
-					print(f"IMPORT : Chunk {chunk_id}: Remaining: {bytes_remaining/1024/1024:.2f} MB | Processed: {total_processed/1024/1024:.2f} MB | Speed: {mb_per_sec:.2f} MB/s")
+					mesologger.info(f"Chunk {chunk_id}: Remaining: {bytes_remaining/1024/1024:.2f} MB | Processed: {total_processed/1024/1024:.2f} MB | Speed: {mb_per_sec:.2f} MB/s")
 					
 					last_log_time = current_time
 			
@@ -598,7 +599,7 @@ def process_chunk(archive_path, chunk_offset, pattern, next_chunk_offset, chunk_
 			elapsed = time.time() - start_time
 			mb_per_sec = (total_processed / 1024 / 1024) / elapsed if elapsed > 0 else 0
 			
-			print(f"IMPORT : CHUNK {chunk_id} COMPLETE Total processed: {total_processed/1024/1024:.2f} MB | Avg Speed: {mb_per_sec:.2f} MB/s")
+			mesologger.info(f"CHUNK {chunk_id} COMPLETE Total processed: {total_processed/1024/1024:.2f} MB | Avg Speed: {mb_per_sec:.2f} MB/s")
 			
 			# Close pigz's stdin to signal end of input
 			pigz_process.stdin.close()
@@ -614,15 +615,15 @@ def process_chunk(archive_path, chunk_offset, pattern, next_chunk_offset, chunk_
 				pigz_error = pigz_process.stderr.read().decode('utf-8', errors='replace')
 				if "corrupted input" in pigz_error and bytes_remaining == 0:
 					# This might be expected if we're cutting across gzip stream boundaries
-					if settings.VERBOSE: print(f"IMPORT : Possible gzip boundary at end of chunk, processing as much as possible")
+					if settings.VERBOSE: mesologger.info(f"Possible gzip boundary at end of chunk, processing as much as possible")
 					return temp_file
 				else:
-					print(f"IMPORT : pigz error (code {pigz_exit_code}): {pigz_error}")
+					mesologger.error(f"pigz error (code {pigz_exit_code}): {pigz_error}")
 					return None
 			   
 			if rg_exit_code != 0 and rg_exit_code != 1:  # ripgrep returns 1 when no matches found
 				rg_error = rg_process.stderr.read().decode('utf-8', errors='replace')
-				print(f"IMPORT : ripgrep error (code {rg_exit_code}): {rg_error}")
+				mesologger.error(f"ripgrep error (code {rg_exit_code}): {rg_error}")
 				return None
 		   
 			return temp_file
@@ -630,15 +631,15 @@ def process_chunk(archive_path, chunk_offset, pattern, next_chunk_offset, chunk_
 			return None
 	   
 	except subprocess.TimeoutExpired:
-		print(f"IMPORT : Timeout processing chunk at offset {chunk_offset}")
+		mesologger.info(f"Timeout processing chunk at offset {chunk_offset}")
 		return None
 		
 	except KeyboardInterrupt:
-		print(f"IMPORT : Chunk {chunk_id} aborted by user")
+		mesologger.warning(f"Chunk {chunk_id} aborted by user")
 		return None
 		
 	except Exception as e:
-		print(f"IMPORT : Error processing chunk at offset {chunk_offset}: {str(e)}")
+		mesologger.error(f"Error processing chunk at offset {chunk_offset}: {str(e)}")
 		return None
 	
 	finally:

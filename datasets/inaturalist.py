@@ -9,6 +9,7 @@
 # TODO: Get more external IDs out of references column
 
 # Settings 
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -32,7 +33,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_inaturalist(session):
-	print(f"IMPORT : ############### Starting iNaturalist Update ###############")
+	mesologger.info(f"############### Starting iNaturalist Update ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_inaturalist(source)
@@ -41,7 +42,7 @@ async def update_inaturalist(session):
 
 # Process a fresh sourcefile
 def process_inaturalist(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
+	mesologger.info(f"Starting to process { source['latest_download'] }...")  
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -81,7 +82,7 @@ def process_inaturalist(source: dict):
 		""")
 		# db.sql(f"SELECT DISTINCT links_raw, COUNT(links_raw) FROM inaturalist GROUP BY links_raw ORDER BY COUNT(links_raw) DESC").show(max_rows=300)
 		# Log
-		print(f"IMPORT : Loaded { db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0] } plants and fungi from inaturalist csv")
+		mesologger.info(f"Loaded { db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0] } plants and fungi from inaturalist csv")
 		# Find hybrids
 		find_hybrids(db,source)
 		# Generic cleanup
@@ -143,7 +144,7 @@ def inaturalist_vernacular(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 			""").fetchdf()
 
 			# Log
-			print(f"IMPORT : Updated {len(updated)} inaturalist taxa with names in {lang} ({filename})")
+			mesologger.info(f"Updated {len(updated)} inaturalist taxa with names in {lang} ({filename})")
 		finally:
 			# Clean up temp table and view
 			db.execute("DROP TABLE IF EXISTS temp_vernacular")

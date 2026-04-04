@@ -18,6 +18,7 @@
 #   Total:  ~150-170s (vs 287s current DuckDB-only, species-only)
 
 # Filesystem helpers
+from ..utils.log import mesologger
 import os
 # JSON serialization for manifest updates
 import json
@@ -86,7 +87,7 @@ PACKAGE_PARTITIONS = 16
 # Compute full geospatial artifact using the new polars-based pipeline
 async def compute_geospatial(release):
 	# Announce start of new geo pipeline stage
-	print(f"IMPORT : ############### Computing Geospatial Data ###############")
+	mesologger.info(f"############### Computing Geospatial Data ###############")
 	# Fall back to latest release when none is provided
 	if not release:
 		# Resolve latest release manifest from releases directory
@@ -94,17 +95,17 @@ async def compute_geospatial(release):
 		# Abort when no release candidate is available
 		if not release:
 			# Log missing release condition
-			print(f"IMPORT : No release candidate found, aborting")
+			mesologger.warning(f"No release candidate found, aborting")
 			# Stop stage because output cannot be attached
 			return
 		# Log fallback release selection
-		else: print(f"IMPORT : No release provided, falling back on latest staging release {release['version']}")
+		else: mesologger.warning(f"No release provided, falling back on latest staging release {release['version']}")
 	# Check whether a geo artifact already exists for this release
 	computed_file = get_file('geo', os.path.join(RELEASES_DIR, release.get('version')))
 	# Skip recomputation unless force mode was requested
 	if computed_file and not settings.FORCE:
 		# Log skip decision and force override hint
-		print(f"IMPORT : Release {release.get('version')} already has a geo file {computed_file}, use -f to overrride")
+		mesologger.info(f"Release {release.get('version')} already has a geo file {computed_file}, use -f to overrride")
 		# Stop stage because output already exists
 		return
 	# Refresh rolling occurrence dataset before geospatial computation
@@ -118,7 +119,7 @@ async def compute_geospatial(release):
 	# Guard against missing occurrence parquet after update
 	if not os.path.isfile(os.path.join(GEO_DIR, 'occurrences.parquet')):
 		# Log missing prerequisite dataset
-		print('IMPORT : No occurrences.parquet available, skipping geo step')
+		mesologger.info('No occurrences.parquet available, skipping geo step')
 		# Stop stage due to missing input
 		return
 	# Build habitat points, raw fallback arrays, and in-memory elevation payloads
@@ -191,7 +192,7 @@ def tile_center_lat(tile_id: pl.Expr) -> pl.Expr:
 # Load occurrences from geoparquet, extract coordinates, filter to accepted taxa, pack per taxon
 def load_occurrences(release: dict) -> pl.DataFrame:
 	# Announce load stage
-	print(f"IMPORT : Loading and packing occurrences")
+	mesologger.info(f"Loading and packing occurrences")
 	# Resolve release parquet for accepted taxa lookup
 	release_parquet = os.path.join(RELEASES_DIR, release.get('version'), f"{release.get('version')}.parquet")
 	# Build lazy accepted taxa table for a streaming join
@@ -207,7 +208,7 @@ def load_occurrences(release: dict) -> pl.DataFrame:
 	# Collect accepted taxa count for logging
 	accepted_count = accepted_lf.select(pl.len().alias("n")).collect().item()
 	# Log accepted taxa count
-	print(f"IMPORT : Loaded {accepted_count:,} accepted gbif_ids from release")
+	mesologger.info(f"Loaded {accepted_count:,} accepted gbif_ids from release")
 	# Build compact occurrence table — one row per taxon with parallel coordinate arrays
 	# WKB POINT layout: bytes 5..13 = longitude (f64), bytes 13..21 = latitude (f64)
 	compact = (
@@ -238,7 +239,7 @@ def load_occurrences(release: dict) -> pl.DataFrame:
 	)
 	# Log compact table stats
 	total_occ = compact.select(pl.col("lng").list.len().sum()).item()
-	print(f"IMPORT : Packed {total_occ:,} occurrences into {len(compact):,} taxa")
+	mesologger.info(f"Packed {total_occ:,} occurrences into {len(compact):,} taxa")
 	# Return compact occurrence table
 	return compact
 
@@ -270,14 +271,14 @@ def load_parentage(release: dict) -> pl.DataFrame:
 		.filter(pl.col("gbif_id") != pl.col("parent_gbif"))
 	)
 	# Log parentage edges
-	print(f"IMPORT : Loaded {len(parentage):,} parent-child edges")
+	mesologger.info(f"Loaded {len(parentage):,} parent-child edges")
 	# Return parent edge table
 	return parentage
 
 # Roll up occurrences to family and below by concatenating children's arrays
 def rollup_to_parents(compact: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
 	# Announce lower-rank rollup stage
-	print(f"IMPORT : Rolling up occurrences to family-level parents")
+	mesologger.info(f"Rolling up occurrences to family-level parents")
 	# Keep only edges whose parent rank is family or below
 	low_parentage = parentage.filter(pl.col("parent_rank").is_in(RAW_ROLLUP_PARENT_RANKS)).select("gbif_id", "parent_gbif")
 	# Seed recursive frontier with direct occurrences for all taxa
@@ -307,7 +308,7 @@ def rollup_to_parents(compact: pl.DataFrame, parentage: pl.DataFrame) -> pl.Data
 		# Save this level's contributions for final merge
 		rollup_parts.append(frontier)
 		# Log level progress
-		print(f"IMPORT : Low rollup level {level}: rolled into {len(frontier):,} parent taxa")
+		mesologger.info(f"Low rollup level {level}: rolled into {len(frontier):,} parent taxa")
 	# Merge direct occurrences with all lower-rank parent contributions
 	rolled = pl.concat(rollup_parts, how="vertical").group_by("taxon").agg(
 		pl.col("lng").list.explode(),
@@ -315,7 +316,7 @@ def rollup_to_parents(compact: pl.DataFrame, parentage: pl.DataFrame) -> pl.Data
 		pl.col("elevation").list.explode(),
 	)
 	# Log lower-rank rollup stats
-	print(f"IMPORT : Low rollup complete: {len(rolled):,} taxa")
+	mesologger.info(f"Low rollup complete: {len(rolled):,} taxa")
 	# Return compact table with lower-rank recursive aggregation applied
 	return rolled
 
@@ -349,7 +350,7 @@ def build_habitat_tile_batch(compact_batch: pl.DataFrame) -> pl.DataFrame:
 # Build habitat tile counts from compact occurrence arrays using chunked batches
 def build_habitat_tiles(compact: pl.DataFrame) -> pl.DataFrame:
 	# Announce habitat tile computation stage
-	print(f"IMPORT : Building habitat tile counts")
+	mesologger.info(f"Building habitat tile counts")
 	# Hold per-batch habitat outputs
 	chunks = []
 	# Iterate taxon batches to reduce peak allocations
@@ -361,14 +362,14 @@ def build_habitat_tiles(compact: pl.DataFrame) -> pl.DataFrame:
 	# Merge all chunk outputs and sum duplicate keys once
 	habitat_tiles = pl.concat(chunks, how="vertical").group_by("gbif_id", "tile_id").agg(pl.col("count").sum().alias("count"))
 	# Log habitat tile stats
-	print(f"IMPORT : Computed {len(habitat_tiles):,} habitat tiles across {habitat_tiles['gbif_id'].n_unique():,} taxa")
+	mesologger.info(f"Computed {len(habitat_tiles):,} habitat tiles across {habitat_tiles['gbif_id'].n_unique():,} taxa")
 	# Return flat habitat tile table
 	return habitat_tiles
 
 # Build exact low-rank median elevations and low-rank elevation profile bins from arrays
 def build_low_elevation_stats(compact: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
 	# Announce low-rank elevation computation stage
-	print(f"IMPORT : Building low-rank elevation medians and profiles")
+	mesologger.info(f"Building low-rank elevation medians and profiles")
 	# Compute exact median elevation while raw arrays still exist
 	low_medians = compact.select(
 		pl.col("taxon").alias("gbif_id"),
@@ -390,14 +391,14 @@ def build_low_elevation_stats(compact: pl.DataFrame) -> tuple[pl.DataFrame, pl.D
 		.select("gbif_id", pl.col("elevation_bin").cast(pl.Int32), pl.col("bin_count").cast(pl.Int64))
 	)
 	# Log low-rank elevation stats
-	print(f"IMPORT : Built low-rank elevation stats for {len(low_medians):,} taxa")
+	mesologger.info(f"Built low-rank elevation stats for {len(low_medians):,} taxa")
 	# Return exact low medians and low profile bins
 	return low_medians, low_bins
 
 # Roll up habitat tile counts above family to avoid kingdom-scale raw occurrence arrays
 def rollup_habitat_to_parents(habitat_tiles: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
 	# Announce upper-rank habitat rollup stage
-	print(f"IMPORT : Rolling up habitat tiles above family")
+	mesologger.info(f"Rolling up habitat tiles above family")
 	# Keep only edges whose parent rank is above family cutoff
 	high_parentage = parentage.filter(~pl.col("parent_rank").is_in(RAW_ROLLUP_PARENT_RANKS)).select("gbif_id", "parent_gbif")
 	# Seed recursive frontier with all current habitat rows
@@ -423,7 +424,7 @@ def rollup_habitat_to_parents(habitat_tiles: pl.DataFrame, parentage: pl.DataFra
 		# Save this level's contributions for final merge
 		rollup_parts.append(frontier)
 		# Log level progress
-		print(f"IMPORT : High rollup level {level}: rolled into {frontier['gbif_id'].n_unique():,} parent taxa")
+		mesologger.info(f"High rollup level {level}: rolled into {frontier['gbif_id'].n_unique():,} parent taxa")
 	# Merge direct habitat with all upper-rank contributions
 	rolled = (
 		pl.concat(rollup_parts, how="vertical")
@@ -431,14 +432,14 @@ def rollup_habitat_to_parents(habitat_tiles: pl.DataFrame, parentage: pl.DataFra
 		.agg(pl.col("count").sum().alias("count"))
 	)
 	# Log upper-rank rollup stats
-	print(f"IMPORT : High rollup complete: {rolled['gbif_id'].n_unique():,} taxa with habitat")
+	mesologger.info(f"High rollup complete: {rolled['gbif_id'].n_unique():,} taxa with habitat")
 	# Return full recursive habitat tile table
 	return rolled
 
 # Roll up elevation profile bins above family using additive bin counts
 def rollup_elevation_to_parents(low_bins: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
 	# Announce upper-rank elevation rollup stage
-	print(f"IMPORT : Rolling up elevation profiles above family")
+	mesologger.info(f"Rolling up elevation profiles above family")
 	# Keep only edges whose parent rank is above family cutoff
 	high_parentage = parentage.filter(~pl.col("parent_rank").is_in(RAW_ROLLUP_PARENT_RANKS)).select("gbif_id", "parent_gbif")
 	# Seed recursive frontier with low-rank bins
@@ -464,7 +465,7 @@ def rollup_elevation_to_parents(low_bins: pl.DataFrame, parentage: pl.DataFrame)
 		# Save this level's contributions for final merge
 		rollup_parts.append(frontier)
 		# Log level progress
-		print(f"IMPORT : Elevation rollup level {level}: rolled into {frontier['gbif_id'].n_unique():,} parent taxa")
+		mesologger.info(f"Elevation rollup level {level}: rolled into {frontier['gbif_id'].n_unique():,} parent taxa")
 	# Merge direct bins with all upper-rank contributions
 	rolled = (
 		pl.concat(rollup_parts, how="vertical")
@@ -472,14 +473,14 @@ def rollup_elevation_to_parents(low_bins: pl.DataFrame, parentage: pl.DataFrame)
 		.agg(pl.col("bin_count").sum().alias("bin_count"))
 	)
 	# Log upper-rank elevation rollup stats
-	print(f"IMPORT : Elevation rollup complete: {rolled['gbif_id'].n_unique():,} taxa with profiles")
+	mesologger.info(f"Elevation rollup complete: {rolled['gbif_id'].n_unique():,} taxa with profiles")
 	# Return full recursive elevation profile table
 	return rolled
 
 # Derive median elevation integers from rolled profile bins
 def medians_from_elevation_bins(all_bins: pl.DataFrame) -> pl.DataFrame:
 	# Announce median derivation stage
-	print(f"IMPORT : Deriving higher-rank median elevations from profiles")
+	mesologger.info(f"Deriving higher-rank median elevations from profiles")
 	# Open in-memory DuckDB for windowed median derivation
 	with duckdb.connect(':memory:') as db:
 		# Route temporary spill files to canopy temp directory
@@ -511,7 +512,7 @@ def finalize_habitat_maps(habitat_tiles: pl.DataFrame) -> pl.DataFrame:
 		tile_center_lat(pl.col("tile_id")).alias("center_lat"),
 	)
 	# Log final habitat point stats
-	print(f"IMPORT : Finalized {len(habitat_points):,} habitat points across {habitat_points['gbif_id'].n_unique():,} taxa")
+	mesologger.info(f"Finalized {len(habitat_points):,} habitat points across {habitat_points['gbif_id'].n_unique():,} taxa")
 	# Return habitat points table
 	return habitat_points
 
@@ -547,7 +548,7 @@ def build_habitat_for_release(release: dict) -> tuple[pl.DataFrame, pl.DataFrame
 		.join(fallback_taxa, on='gbif_id', how='inner')
 	)
 	# Log low-tile fallback taxon count
-	print(f"IMPORT : Prepared {len(raw_fallback_arrays):,} raw centroid fallback taxa (<{HABITAT_TILE_THRESHOLD} tiles)")
+	mesologger.warning(f"Prepared {len(raw_fallback_arrays):,} raw centroid fallback taxa (<{HABITAT_TILE_THRESHOLD} tiles)")
 	# Roll elevation bins recursively above family to top-level taxa
 	elevation_bins = rollup_elevation_to_parents(low_bins, parentage)
 	# Release low-bin and pre-roll habitat rows before finalization
@@ -747,7 +748,7 @@ def cluster_worker(record: tuple) -> dict:
 # Compute mixed centroid outputs from staged habitat and raw fallback parquets
 def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.DataFrame:
 	# Announce centroid clustering stage
-	print(f"IMPORT : Clustering habitat centroids")
+	mesologger.info(f"Clustering habitat centroids")
 	# Load only clustering columns from staged habitat parquet
 	habitat = (
 		pl.scan_parquet(habitat_path)
@@ -784,7 +785,7 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 	# Track total taxa prepared for clustering
 	total_records = weighted_count + fallback_count
 	# Log split counts for weighted and fallback modes
-	print(f"IMPORT : Prepared {weighted_count:,} weighted taxa and {fallback_count:,} raw fallback taxa")
+	mesologger.warning(f"Prepared {weighted_count:,} weighted taxa and {fallback_count:,} raw fallback taxa")
 	# Stream worker input records instead of materializing one huge Python list
 	def record_iter():
 		# Yield weighted clustering records first
@@ -800,7 +801,7 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 	# Cap Windows worker fan-out to reduce CreateProcess WinError 8 under high memory pressure
 	if os.name == 'nt': workers = min(workers, 5)
 	# Log worker pool settings
-	print(f"IMPORT : Running centroid clustering with {workers} workers")
+	mesologger.info(f"Running centroid clustering with {workers} workers")
 	# Start clustering timer
 	t0 = datetime.now(timezone.utc)
 	# Hold clustered rows
@@ -812,7 +813,7 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 			# Append clustered row
 			rows.append(row)
 			# Emit periodic single-line progress updates
-			if idx % 5000 == 0: print(f"\rIMPORT : Clustered {idx:,}/{total_records:,} taxa", end="", flush=True)
+			if idx % 5000 == 0: mesologger.info(f"Clustered {idx:,}/{total_records:,} taxa", extra={'sameline': True})
 	# Release grouped arrays once worker consumption is complete
 	del weighted_arrays
 	del raw_fallback_arrays
@@ -821,14 +822,14 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 	# Compute elapsed seconds for logs
 	elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
 	# Log clustering completion on the same carriage-return line as progress updates
-	print(f"\rIMPORT : Clustered {len(centroids):,} taxa in {elapsed:.1f}s ({len(centroids)/max(0.001, elapsed):.1f} taxa/s)")
+	mesologger.info(f"Clustered {len(centroids):,} taxa in {elapsed:.1f}s ({len(centroids)/max(0.001, elapsed):.1f} taxa/s)", extra={'sameline': True})
 	# Return clustered centroids frame
 	return centroids
 
 # Package habitat, centroid, and elevation outputs into release geo parquet artifact from staged parquet files
 def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: str, elevation_bins_path: str, elevation_medians_path: str):
 	# Announce packaging stage
-	print(f"IMPORT : Packaging geo artifact")
+	mesologger.info(f"Packaging geo artifact")
 	# Resolve target release directory
 	release_dir = os.path.join(RELEASES_DIR, release.get('version'))
 	# Build date-stamped geo artifact name
@@ -903,9 +904,9 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 				) TO '{part_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
 			""")
 			# Emit periodic single-line packaging progress updates
-			print(f"\rIMPORT : Packaged geo partition {part + 1}/{PACKAGE_PARTITIONS}", end="", flush=True)
+			mesologger.info(f"Packaged geo partition {part + 1}/{PACKAGE_PARTITIONS}", extra={'sameline': True})
 		# Print newline after carriage-return partition updates
-		print()
+		
 		# Merge all partition outputs into final geo artifact
 		db.execute(f"COPY (SELECT * FROM read_parquet('{os.path.join(parts_dir, '*.parquet').replace('\\', '/')}')) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
 	# Remove partition outputs after final merge succeeds
@@ -913,7 +914,7 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 		# Delete partition file when present
 		if os.path.isfile(path): os.remove(path)
 	# Log saved geo artifact path
-	print(f"IMPORT : Saved table to {release_dir}/{filename}")
+	mesologger.info(f"Saved table to {release_dir}/{filename}")
 	# Attach geo filename to release manifest payload
 	release['geo'] = filename
 	# Persist release manifest with new geo artifact reference

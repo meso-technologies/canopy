@@ -13,6 +13,7 @@
 #			TODO: Handle outdated genus like asclepiadaceae
 #			TODO: order (cupressales │ pinales | pinales) class (equisetopsida │ magnoliopsida │ equisetopsida) and phylum (streptophyta │ tracheophyta │ streptophyta) all seem to have one mismatch each
 
+from ..utils.log import mesologger
 import os
 
 # Settings
@@ -58,11 +59,11 @@ higher_ranks = ['species','genus','family','"order"','class','phylum']
 # The flow runs in three phases: map, enrich, then reduce.
 def fuse(results):
 	# Announce fusion stage start
-	print(f"IMPORT : ############### Fusing processed results ###############")
+	mesologger.info(f"############### Fusing processed results ###############")
 	# Fall back to latest processed artifacts when caller skipped process step
 	if not results:
 		# Log fallback behavior for operator visibility
-		print(f"IMPORT : No processed file list provided, falling back on latest processed files")
+		mesologger.warning(f"No processed file list provided, falling back on latest processed files")
 		# Load latest processed source inventory from disk
 		results = get_latest_processed()
 	# Keep one in-memory DuckDB connection for full fusion flow
@@ -72,7 +73,7 @@ def fuse(results):
 		# Configure DuckDB S3 settings when reading/writing S3 parquet files
 		if storage.is_s3(): storage.configure_duckdb(db)
 		# MAP phase: maximize name coverage and cross-source identifier linking
-		print(f"IMPORT : ############### Building Initial Name Index ###############")
+		mesologger.info(f"############### Building Initial Name Index ###############")
 		# Load data
 		load_map_sources(results, db)
 		# Start with complete list of proper names
@@ -86,7 +87,7 @@ def fuse(results):
 		# Optionally inspect mapped backbone table statistics
 		if settings.VERBOSE: db.sql("SUMMARIZE meso;").show()
 		# ENRICH phase: add non-core attributes like vernacular, status flags, and external context
-		print(f"IMPORT : ############### Enriching Data ###############")
+		mesologger.info(f"############### Enriching Data ###############")
 		# Load extra tables we might need in vernacular, enrich etc
 		load_enrich_sources(results, db)
 		# Add more data from IUCN, Wikidata etc
@@ -96,7 +97,7 @@ def fuse(results):
 		# Optionally inspect enriched backbone table statistics
 		if settings.VERBOSE: db.sql("SUMMARIZE meso;").show()
 		# REDUCE phase: collapse to accepted taxa and stable parent hierarchy
-		print(f"IMPORT : ############### Reducing Backbone ###############")
+		mesologger.info(f"############### Reducing Backbone ###############")
 		# Add higher level ranks 
 		add_higher_ranks(results, db)
 		# Decide which species etc we want to build pages for
@@ -130,14 +131,14 @@ def load_map_sources(results: dict, db: duckdb.DuckDBPyConnection):
 	db.execute(f"""CREATE TYPE taxon_rank_enum AS ENUM ('{"', '".join([e.name for e in TaxonRank])}')""")
 	# Create enum for sources
 	db.execute(f"""CREATE TYPE source_enum AS ENUM ('{"', '".join(core_authorities)}')""")
-	print(f"IMPORT : Created taxon_rank_enum and source_enum")
+	mesologger.info(f"Created taxon_rank_enum and source_enum")
 
 def load_enrich_sources(results: dict, db: duckdb.DuckDBPyConnection):
 	# Extra source for enrichment
 	for source in ['iucn','ncbi']: load_parquet(results,db,source)
 
 def basic_consensus(results: dict, db: duckdb.DuckDBPyConnection):
-	print(f"IMPORT : ############### Creating basic consensus ###############")
+	mesologger.info(f"############### Creating basic consensus ###############")
 	# Core votes
 	vote(results,db,'name_clean')
 	vote(results,db,'rank_clean',[a for a in core_authorities if a != 'gbif'])
@@ -174,8 +175,8 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 		FROM fungorum
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'ipni'").fetchone()[0]:,} plant names from IPNI""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'fungorum'").fetchone()[0]:,} fungi names from Fungorum""")
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'ipni'").fetchone()[0]:,} plant names from IPNI""")
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'fungorum'").fetchone()[0]:,} fungi names from Fungorum""")
 
 	# Add WCVP plants that are not (yet) in IPNI
 	db.execute(f"""
@@ -195,14 +196,14 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 		AND NOT EXISTS (SELECT 1 FROM meso m WHERE m.name_clean = w.name_clean)
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'wcvp'").fetchone()[0]:,} plant names from WCVP""")
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'wcvp'").fetchone()[0]:,} plant names from WCVP""")
 	# Also add WCVP IDs to existing IPNI rows
 	db.execute("""
 		WITH wcvp_lookup AS (SELECT DISTINCT id_raw, powo_id FROM wcvp WHERE powo_id IS NOT NULL)
 		UPDATE meso m SET wcvp_id = w.id_raw
 		FROM wcvp_lookup w WHERE m.wcvp_id IS NULL AND m.ipni_id = w.powo_id;
 	""")
-	print(f"IMPORT : Added WCVP IDs to existing IPNI rows")
+	mesologger.info(f"Added WCVP IDs to existing IPNI rows")
 
 	# Add POWO plants that are neither in IPNI nor WCVP
 	db.execute(f"""
@@ -221,12 +222,12 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 			NOT EXISTS (SELECT 1 FROM meso m WHERE m.name_clean = p.name_clean)
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'powo'").fetchone()[0]:,} plant names from POWO""")
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'powo'").fetchone()[0]:,} plant names from POWO""")
 	# Also add WCVP & POWO IDs to existing rows
 	# This order is weirdly much faster than any CTE 
 	db.execute("""UPDATE meso m SET wcvp_id = p.wcvp_id FROM powo p WHERE m.wcvp_id IS NULL AND m.powo_id = p.id_raw;""")
 	db.execute("""UPDATE meso m SET powo_id = p.id_raw FROM powo p WHERE p.wcvp_id IS NOT NULL AND m.wcvp_id = p.wcvp_id;""")
-	print(f"IMPORT : Added POWO IDs to existing IPNI/WCVP rows")
+	mesologger.info(f"Added POWO IDs to existing IPNI/WCVP rows")
 
 	# Start adding WFO
 	db.execute(f"""
@@ -247,7 +248,7 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 			NOT EXISTS (SELECT 1 FROM meso m WHERE m.name_clean = w.name_clean)
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'wfo'").fetchone()[0]:,} plant names from WFO""")	
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'wfo'").fetchone()[0]:,} plant names from WFO""")	
 	# Also add WFO IDs to existing WCVP rows
 	db.execute("""
 		WITH wfo_lookup AS (SELECT DISTINCT id_raw, ipni_id, tropicos_id FROM wfo WHERE ipni_id IS NOT NULL)
@@ -256,7 +257,7 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 			tropicos_id = w.tropicos_id
 		FROM wfo_lookup w WHERE m.wfo_id IS NULL AND m.source NOT IN ('wfo','fungorum') AND m.ipni_id = w.ipni_id;
 	""")
-	print(f"IMPORT : Added WFO IDs to existing IPNI/WCVP/POWO rows")
+	mesologger.info(f"Added WFO IDs to existing IPNI/WCVP/POWO rows")
 
 	# Add MycoBank becore CoL, as CoL has both plants and Fungi
 	db.execute(f"""
@@ -276,14 +277,14 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 			NOT EXISTS (SELECT 1 FROM meso m WHERE m.name_clean = mb.name_clean)
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'mycobank'").fetchone()[0]:,} fungi names from MycoBank""")	
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'mycobank'").fetchone()[0]:,} fungi names from MycoBank""")	
 	# Also add IDs to existing Fungorum rows
 	db.execute("""
 		WITH mb_lookup AS (SELECT DISTINCT id_raw, fungorum_id FROM mycobank WHERE fungorum_id IS NOT NULL)
 		UPDATE meso m SET mycobank_id = mb.fungorum_id
 		FROM mb_lookup mb WHERE m.wfo_id IS NULL AND m.source != 'mycobank' AND m.fungorum_id = mb.fungorum_id;
 	""")
-	print(f"IMPORT : Added MycoBank IDs to existing Fungorum rows")
+	mesologger.info(f"Added MycoBank IDs to existing Fungorum rows")
 
 	# Add CoL / World of Plants
 	db.execute(f"""
@@ -308,7 +309,7 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 			NOT EXISTS (SELECT 1 FROM meso m WHERE m.name_clean = c.name_clean)
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'col'").fetchone()[0]:,} plant & Fungi names from CoL""")	
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'col'").fetchone()[0]:,} plant & Fungi names from CoL""")	
 	# Also add CoL IDs to existing rows, one by one is fastest
 	for extra_col_id in ['wfo_id', 'powo_id','fungorum_id','tropicos_id']:
 		db.execute(f"""
@@ -321,7 +322,7 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 				tropicos_id = COALESCE(m.tropicos_id, c.tropicos_id)
 			FROM col_lookup c WHERE m.col_id IS NULL AND m.{extra_col_id} = c.{extra_col_id};
 		""")
-	print(f"IMPORT : Added CoL IDs to existing IPNI/Fungorum/WCVP/POWO/WFO rows")
+	mesologger.info(f"Added CoL IDs to existing IPNI/Fungorum/WCVP/POWO/WFO rows")
 
 	# Insert unique Tropicos names into the meso table
 	db.execute(f"""
@@ -334,7 +335,7 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 		FROM tropicos WHERE name_clean NOT IN (SELECT name_clean FROM meso)
 		{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 	""")
-	print(f"""IMPORT : Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'tropicos'").fetchone()[0]:,} plant names from Tropicos""")
+	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'tropicos'").fetchone()[0]:,} plant names from Tropicos""")
 	# Also add Tropicos IDs to existing WCVP rows
 	# db.execute("""
 	#	WITH tropicos_lookup AS (SELECT DISTINCT id_raw, name_clean, rank_clean FROM tropicos)
@@ -342,14 +343,14 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 	#	-- We only can match Tropicos based on name and rank, let's check how that goes
 	#	FROM tropicos_lookup t WHERE m.tropicos_id IS NULL AND m.source NOT IN ('tropicos','fungorum','mycobank') AND m.name_clean = t.name_clean AND m.rank_clean = t.rank_clean;
 	#""")
-	#print(f"IMPORT : Added Tropicos IDs to existing IPNI/WCVP/POWO/WFO/CoL rows")
+	#mesologger.info(f"Added Tropicos IDs to existing IPNI/WCVP/POWO/WFO/CoL rows")
 	# Log
-	print(f"IMPORT : Added {db.table('meso').shape[0]:,} names to meso")
+	mesologger.info(f"Added {db.table('meso').shape[0]:,} names to meso")
 	if settings.VERBOSE: db.sql(f"SUMMARIZE meso").show(max_rows=20)	
 
 # IDs to make future lookups easier while we don't have a unique id yet
 def add_ids(results: dict, db: duckdb.DuckDBPyConnection):		
-	print(f"IMPORT : ############### Adding Dataset ID's ###############")
+	mesologger.info(f"############### Adding Dataset ID's ###############")
 	# db.execute(f"CREATE TEMP TABLE wikidata_ids AS SELECT id_raw, ipni_id, fungorum_id, powo_id, wfo_id, tropicos_id FROM wikidata")
 	if settings.VERBOSE: db.sql(f"SUMMARIZE wikidata").show(max_rows=60)
 	# Make sure we have the wikidata column
@@ -366,19 +367,19 @@ def add_ids(results: dict, db: duckdb.DuckDBPyConnection):
 		# Add ID
 		db.execute(f"""UPDATE meso m SET wikidata_id = w.id_raw FROM wikidata w WHERE wikidata_id IS NULL AND w.{id} IS NOT NULL AND m.{id} = w.{id};""")
 	initial_count = db.execute("SELECT COUNT(wikidata_id) FROM meso").fetchone()[0]
-	print(f"""IMPORT : Added {initial_count:,} Wikidata IDs via core authority IDs""")
+	mesologger.info(f"""Added {initial_count:,} Wikidata IDs via core authority IDs""")
 	# Try backfilling rest via name, eg Angiosperms have no core IDs
 	db.execute(f"""
 		UPDATE meso m SET wikidata_id = w.id_raw FROM wikidata w 
 		WHERE wikidata_id IS NULL AND m.name_clean = w.name_clean AND NOT EXISTS (SELECT 1 FROM meso WHERE wikidata_id = w.id_raw);
 	""")	
-	print(f"IMPORT : Added {int(db.execute("SELECT COUNT(wikidata_id) FROM meso").fetchone()[0]-initial_count):,} more Wikidata IDs via name match")
+	mesologger.info(f"Added {int(db.execute("SELECT COUNT(wikidata_id) FROM meso").fetchone()[0]-initial_count):,} more Wikidata IDs via name match")
 	# See if we have any IDs that we didn't correlate when building the initial backbone - keep seperate from loop above as coalesce() would otherwise slow both down
 	db.execute(f"""
 		UPDATE meso m SET {','.join([f'{authority}_id = COALESCE(m.{authority}_id, w.{authority}_id{("::UINTEGER" if str(authority + "_id") in int_ids else "")})' for authority in id_authorities if authority not in ('wikidata', 'wcvp')])}
 		FROM wikidata w WHERE m.wikidata_id = w.id_raw;			
 	""")
-	print(f"IMPORT : Supplemented existing sources with IDs from Wikidata")
+	mesologger.info(f"Supplemented existing sources with IDs from Wikidata")
 	# Also try backfilling based on name from each source dataset
 	for authority in id_authorities:
 		# Don't do Wikidata again, and we can also be sure to have 100% of ipni and fungorum when we started the table
@@ -398,14 +399,14 @@ def add_ids(results: dict, db: duckdb.DuckDBPyConnection):
 			FROM single_matches sm WHERE meso.rowid = sm.meso_rowid;
 		""")
 		after = db.execute(f"SELECT COUNT({authority}_id) FROM meso").fetchone()[0]
-		print(f"IMPORT : Added {after-before:,} {authority} IDs from source datasets via name match.")
+		mesologger.info(f"Added {after-before:,} {authority} IDs from source datasets via name match.")
 	# Do this here as we need rank, pagecount etc in our core consensus logic and logging
 	db.execute(f"""
 		-- Add wikidata details
 		ALTER TABLE meso ADD COLUMN IF NOT EXISTS wikidata_pagecount SMALLINT;
 	""")
 	db.execute(f"""UPDATE meso m SET wikidata_pagecount = w.page_count FROM wikidata w WHERE w.page_count IS NOT NULL AND m.wikidata_id = w.id_raw;""")
-	print(f"IMPORT : Added Wikidata pagecount")
+	mesologger.info(f"Added Wikidata pagecount")
 
 # Create our kingdom:phylum:class:order:family:genus:species:foo.bar unique string and then hash it into UUID5
 def create_hashes(results: dict, db: duckdb.DuckDBPyConnection):
@@ -421,7 +422,7 @@ def create_hashes(results: dict, db: duckdb.DuckDBPyConnection):
 		-- Make author optional, IPNI has a bunch of names without authors https://www.ipni.org/n/17051740-1
 		UPDATE meso SET id_input = lower(concat_ws(':',kingdom,rank_consensus,replace(name_consensus, ' ', '.'),author_consensus,year_consensus))
 	""")
-	print(f"IMPORT : Creating Meso ID hashes...")
+	mesologger.info(f"Creating Meso ID hashes...")
 	# Register pyarrow hashing function
 	db.create_function('make_uuid',uuid_v5_udf,['VARCHAR'],'UUID',type='arrow')
 	# Then hash the main ID
@@ -430,7 +431,7 @@ def create_hashes(results: dict, db: duckdb.DuckDBPyConnection):
 		UPDATE meso SET id_meso = make_uuid(id_input);
 		ALTER TABLE meso DROP COLUMN IF EXISTS id_input;
 	""")
-	print(f"\nIMPORT : Hashing complete")
+	mesologger.info(f"Hashing complete")
 	# Start handling duplicates
 	"""
 			Duplicate IDs are mostly a function of bad ID mapping, both between source datasets like WCVP/POWO, WFO, etc
@@ -445,7 +446,7 @@ def create_hashes(results: dict, db: duckdb.DuckDBPyConnection):
 	""")
 	dupes = db.sql(f"SELECT COUNT(*) FROM meso WHERE dedupe").fetchone()[0]
 	if dupes: 
-		print(f"IMPORT : Consolidating {dupes:,} rows with duplicate IDs after initial hashing...")
+		mesologger.info(f"Consolidating {dupes:,} rows with duplicate IDs after initial hashing...")
 		# Show redundant data
 		if settings.VERBOSE: 
 			db.sql(f"""
@@ -487,7 +488,7 @@ def create_hashes(results: dict, db: duckdb.DuckDBPyConnection):
 			ALTER TABLE meso DROP COLUMN dedupe;
 		""")
 		reduced_id_count = db.sql(f"SELECT COUNT(*) FROM meso").fetchone()[0]
-		print(f"""IMPORT : Reduced {initial_count:,} rows to {reduced_id_count:,} by consolidating those {dupes:,} duplicate IDs""")
+		mesologger.info(f"""Reduced {initial_count:,} rows to {reduced_id_count:,} by consolidating those {dupes:,} duplicate IDs""")
 
 # Additional iNaturalist, IUCN, Wikidata to complete full dataset
 def enrich(results: dict, db: duckdb.DuckDBPyConnection):
@@ -503,25 +504,25 @@ def enrich(results: dict, db: duckdb.DuckDBPyConnection):
 	result = db.sql("SELECT * FROM meso WHERE hybridpos_consensus > 25 ORDER BY hybridpos_consensus DESC")
 	rows = result.fetchdf()
 	if len(rows) > 0:
-		print(f"IMPORT : WARNING {len(rows)} rows with suspicious hybridpos")
+		mesologger.warning(f"{len(rows)} rows with suspicious hybridpos")
 		if settings.VERBOSE: result.show()
 	# Add extra ID fields
 	for id in additional_ids: 
 		db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS {id} {'UINTEGER' if id in int_ids else 'VARCHAR'};""")
 		db.execute(f"""UPDATE meso m SET {id} = w.{id} FROM wikidata w WHERE w.{id} IS NOT NULL AND m.wikidata_id = w.id_raw;""")
-	print(f"""IMPORT : Added additional IDs via wikidata to about {db.execute("SELECT COUNT(wikidata_pagecount) FROM meso").fetchone()[0]:,} entries""")
+	mesologger.info(f"""Added additional IDs via wikidata to about {db.execute("SELECT COUNT(wikidata_pagecount) FROM meso").fetchone()[0]:,} entries""")
  	# Set Wikidata flags
 	for flag in wikidata_flags: 
 		# We don't set default false here to not break mode() later
 		db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS {flag} BOOLEAN;""")
 		db.execute(f"""UPDATE meso m SET {flag} = w.{flag} FROM wikidata w WHERE w.{flag} IS NOT NULL AND m.wikidata_id = w.id_raw;""")
-	print(f"""IMPORT : Added Wikidata flags to about {db.execute("SELECT COUNT(wikidata_pagecount) FROM meso").fetchone()[0]:,} entries""")
+	mesologger.info(f"""Added Wikidata flags to about {db.execute("SELECT COUNT(wikidata_pagecount) FROM meso").fetchone()[0]:,} entries""")
 	# Add english wikipedia page name
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS wikipedia_page VARCHAR;""")
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS wikicommons VARCHAR;""")
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS wikispecies VARCHAR;""")
 	db.execute(f"""UPDATE meso m SET wikipedia_page = w.wikipedia_pages.en, wikicommons = w.wikicommons, wikispecies = w.wikispecies FROM wikidata w WHERE m.wikidata_id = w.id_raw;""")
-	print(f"""IMPORT : Added English/Commons/Species wikipedia pages to {db.execute("SELECT COUNT(*) FROM meso WHERE wikipedia_page IS NOT NULL").fetchone()[0]:,} entries""")	
+	mesologger.info(f"""Added English/Commons/Species wikipedia pages to {db.execute("SELECT COUNT(*) FROM meso WHERE wikipedia_page IS NOT NULL").fetchone()[0]:,} entries""")	
 	# Add wikipedia author Q identifier and BHL page
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS qauthor VARCHAR;""")
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS bhl_page UINTEGER;""")
@@ -541,7 +542,7 @@ def enrich(results: dict, db: duckdb.DuckDBPyConnection):
 			perennial = COALESCE(NULLIF(meso.perennial, FALSE), wcvp.perennial) 
 		FROM wcvp WHERE meso.wcvp_id = wcvp.id_raw;
 	""")
-	print(f"""IMPORT : Added annual/perennial values from POWO and WCVP""")	
+	mesologger.info(f"""Added annual/perennial values from POWO and WCVP""")	
 	# Add native habitats and regions
 	for tdwgcolumn in ['native_to','regions']:
 		# Avoid list defaults in ALTER TABLE here because DuckDB can hit non-flat vector internal errors
@@ -555,7 +556,7 @@ def enrich(results: dict, db: duckdb.DuckDBPyConnection):
 			""")
 		db.execute(f"""UPDATE meso SET { tdwgcolumn } = NULL WHERE len({ tdwgcolumn }) = 0;""")
 		sql = f"SELECT COUNT(*) FROM meso WHERE { tdwgcolumn } IS NOT NULL"
-		print(f"""IMPORT : Added { tdwgcolumn } to {db.execute(sql).fetchone()[0]:,} entries""")
+		mesologger.info(f"""Added { tdwgcolumn } to {db.execute(sql).fetchone()[0]:,} entries""")
 	# Add IUCN status and assessment ID for building direct redlist links
 	db.execute(f"""
 		CREATE TYPE iucn_status_enum AS ENUM ('LC', 'EW', 'CR', 'VU', 'EN', 'EX', 'DD', 'NT');
@@ -566,12 +567,12 @@ def enrich(results: dict, db: duckdb.DuckDBPyConnection):
 			iucn_assessment = iucn.iucn_assessment
 		FROM iucn iucn WHERE meso.iucn_id IS NOT NULL AND meso.iucn_id = iucn.id_raw;
 	""")
-	print(f"""IMPORT : Added IUCN status to {db.execute("SELECT COUNT(iucn_status) FROM meso").fetchone()[0]:,} entries""")
+	mesologger.info(f"""Added IUCN status to {db.execute("SELECT COUNT(iucn_status) FROM meso").fetchone()[0]:,} entries""")
 
 
 # Merge and deduplicate all vernacular names
 def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
-	print(f"IMPORT : ############### Reducing vernacular names ###############")
+	mesologger.info(f"############### Reducing vernacular names ###############")
 	# Fastest query as measured with plenty of A/B tests
 	db.execute("""
 		CREATE TEMP TABLE wikidata_vernacular AS
@@ -579,7 +580,7 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 		JOIN wikidata w ON m.wikidata_id = w.id_raw AND cardinality(w.vernacular) > 0
 		CROSS JOIN LATERAL UNNEST(map_entries(w.vernacular)) AS t(kv);
 	""")
-	print(f"""IMPORT : Loaded wikidata vernacular names for {db.execute("SELECT COUNT(*) FROM wikidata_vernacular").fetchone()[0]:,} item/language pairs""")
+	mesologger.info(f"""Loaded wikidata vernacular names for {db.execute("SELECT COUNT(*) FROM wikidata_vernacular").fetchone()[0]:,} item/language pairs""")
 	# Create the table for higher quality vernacular names
 	db.execute(f"""CREATE TEMP TABLE quality_vernacular (id_meso UUID, name_consensus VARCHAR, lang VARCHAR, names VARCHAR[]);""")
 	current_count = 0
@@ -598,7 +599,7 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 			GROUP BY m.id_meso, m.name_consensus, lang
 		""")
 		total_count = db.execute("SELECT COUNT(*) FROM quality_vernacular").fetchone()[0]
-		print(f"IMPORT : Added {int(total_count-current_count):,} vernacular names from {source}")
+		mesologger.info(f"Added {int(total_count-current_count):,} vernacular names from {source}")
 		current_count = total_count
 	# Log
 	if settings.VERBOSE:
@@ -619,14 +620,14 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 		DROP TABLE quality_vernacular;
 		DROP TABLE wikidata_vernacular;
 	""")
-	print(f"IMPORT : Merged vernacular data into {db.execute("SELECT COUNT(*) FROM merged_vernacular").fetchone()[0]:,} ID/language pairs")
+	mesologger.info(f"Merged vernacular data into {db.execute("SELECT COUNT(*) FROM merged_vernacular").fetchone()[0]:,} ID/language pairs")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular ORDER BY id_meso DESC").show()
 	# Delete all rows that have empty arrays (because we remove name_consensus values in the previous step and that's all they had)
 	db.execute("DELETE FROM merged_vernacular WHERE len(names) = 0;")
-	print("IMPORT : Deleted rows with no remaining names")
+	mesologger.info("Deleted rows with no remaining names")
 	# Consolidate single unique values
 	db.execute(f"""UPDATE merged_vernacular SET names =  list_value(list_any_value(names)) WHERE len(names) > 1 AND list_unique(names) = 1""")
-	print("IMPORT : Collapsed name lists that only had a single unique value")
+	mesologger.info("Collapsed name lists that only had a single unique value")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular ORDER BY id_meso DESC").show()
 	# Start processing longer name lists
 	# Add extra columns, mark and copy names
@@ -646,18 +647,18 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 	""")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular WHERE process;").show()
 	remaining = db.execute("SELECT COUNT(*) FROM merged_vernacular WHERE process").fetchone()[0]
-	print(f"IMPORT : Starting Levenshtein process for {remaining:,} rows...")
+	mesologger.info(f"Starting Levenshtein process for {remaining:,} rows...")
 	while True:
 		# Extract: Find any names that are Levenshtein distance < 3 from the first item in the (remaining) source list
-		print(f"\rIMPORT : (lev:bucket) {remaining:,} rows left to process               ",end="")
+		mesologger.info(f"(lev:bucket) {remaining:,} rows left to process               ", extra={'sameline': True})
 		db.execute("""UPDATE merged_vernacular SET 
 			-- Put our first value and all similar names in a bucket
 			bucket = list_distinct([names[1]] || list_filter(names, x -> levenshtein(names[1],x) < 3)) WHERE process;""")
 		# Also set the most common value
-		print(f"\rIMPORT : (lev:common) {remaining:,} rows left to process               ",end="")
+		mesologger.info(f"(lev:common) {remaining:,} rows left to process               ", extra={'sameline': True})
 		db.execute("""UPDATE merged_vernacular SET most_common = list_mode(bucket) WHERE process;""")
 		# Replace: Replace their occurrence in the target list with the most common spelling variant
-		print(f"\rIMPORT : (lev:transf) {remaining:,} rows left to process               ",end="")
+		mesologger.info(f"(lev:transf) {remaining:,} rows left to process               ", extra={'sameline': True})
 		db.execute("""UPDATE merged_vernacular SET 
 			names = list_filter(names, x -> NOT list_contains(bucket, x)),
 			-- Faster if we only do it for operations where we actually need to replace multiple names with common_name 
@@ -667,20 +668,18 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 			WHERE process 
 		""")
 		# Limit and speed up next round
-		print(f"\rIMPORT : (lev:update) {remaining:,} rows left to process               ",end="")
+		mesologger.info(f"(lev:update) {remaining:,} rows left to process               ", extra={'sameline': True})
 		db.execute("""UPDATE merged_vernacular SET process = FALSE WHERE process AND len(names) = 0;""")
 		# See if we have anything left
 		remaining = db.execute("SELECT COUNT(*) FROM merged_vernacular WHERE process").fetchone()[0]
-		print(f"\rIMPORT : (lev:counts) {remaining:,} rows left to process               ",end="")
+		mesologger.info(f"(lev:counts) {remaining:,} rows left to process               ", extra={'sameline': True})
 		if settings.VERBOSE: 
-			print('\n')
 			db.sql("SELECT * FROM merged_vernacular WHERE process ORDER BY len(names) DESC;").show()
-			print('\n')
 		# We stop early at 10 because some entries like https://www.wikidata.org/wiki/Q81602 have an unnecessary 
 		# and wrong long tail we don't need and traversing long list takes long even for few rows.	
 		if remaining <= 10: break
 	# Log completion
-	print(f"\nIMPORT : Levenshtein complete")	
+	mesologger.info(f"Levenshtein complete")	
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular WHERE len(target) > 0 ORDER BY len(target) DESC;").show()
 	# Reset names to processed values
 	db.execute(f"""
@@ -692,14 +691,14 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 	""")	
 	# Consolidate single unique values once more for rows that only had a single unique levenshtein < 3 value
 	db.execute(f"""UPDATE merged_vernacular SET names = list_value(list_any_value(names)) WHERE len(names) > 1 AND list_unique(names) = 1""")
-	print("IMPORT : Collapsed name lists that only had a single unique value after Levenshtein processing")
+	mesologger.info("Collapsed name lists that only had a single unique value after Levenshtein processing")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular ORDER BY id_meso DESC").show()
 	# Register UDF
 	vernacular_struct = duckdb.struct_type({"lang": duckdb.sqltype("VARCHAR"),"names": duckdb.list_type(duckdb.sqltype("VARCHAR"))})
 	db.create_function('vernacular_udf', vernacular_udf, [vernacular_struct], 'VARCHAR[]', type='arrow')
 	# Process long name arrays in polars
 	db.execute(f"""UPDATE merged_vernacular SET names = vernacular_udf(struct_pack(lang := lang, names := names)) WHERE len(names) > 1""")	
-	print(f"\nIMPORT : Vernacular name processing complete")
+	mesologger.info(f"Vernacular name processing complete")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular WHERE len(names) > 1 ORDER BY id_meso DESC").show()
 	# Add processed names back to main table
 	db.execute(f"""
@@ -717,14 +716,14 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 		) mv
 		WHERE m.id_meso = mv.id_meso;
 	""")
-	print(f"IMPORT : Added vernacular names to {db.execute("SELECT COUNT(*) FROM meso WHERE cardinality(vernacular) > 0").fetchone()[0]:,} rows")
+	mesologger.info(f"Added vernacular names to {db.execute("SELECT COUNT(*) FROM meso WHERE cardinality(vernacular) > 0").fetchone()[0]:,} rows")
 	if settings.VERBOSE: db.sql('SELECT id_meso, name_consensus, vernacular FROM meso WHERE vernacular IS NOT NULL ORDER BY cardinality(vernacular) DESC').show()
 	# Add most common english name as dedicated VARCHAR column
 	db.execute(f"""
 		ALTER TABLE meso ADD COLUMN common_name VARCHAR;
 		UPDATE meso SET common_name = list_mode(vernacular.en) WHERE vernacular IS NOT NULL;
 	""")
-	print(f"""IMPORT : Added common name to {db.execute("SELECT COUNT(common_name) FROM meso").fetchone()[0]:,} rows""")
+	mesologger.info(f"""Added common name to {db.execute("SELECT COUNT(common_name) FROM meso").fetchone()[0]:,} rows""")
 
 # Walk up the parentage tree to add higher ranks
 def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
@@ -735,7 +734,7 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 		f'CAST({auth}_id AS VARCHAR)' if f'{auth}_id' in int_ids else f'{auth}_id' 
 		for auth in core_authorities
 	])
-	print("IMPORT : Linking orphaned species to their genus")
+	mesologger.info("Linking orphaned species to their genus")
 	db.execute(f"""
 		UPDATE meso 
 		SET parent_consensus = (
@@ -751,7 +750,7 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 		AND array_length(str_split(meso.name_consensus, ' ')) = 2
 	""")
 	# Fix orphaned infraspecifics by linking to their species
-	print("IMPORT : Linking orphaned infraspecifics to their species")
+	mesologger.info("Linking orphaned infraspecifics to their species")
 	db.execute(f"""
 		UPDATE meso 
 		SET parent_consensus = (
@@ -767,10 +766,10 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 		AND meso.rank_consensus IN ('SUBSPECIES', 'VARIETY', 'FORM', 'SUBVARIETY', 'SUBFORM', 'LUSUS')
 		AND array_length(str_split(meso.name_consensus, ' ')) >= 3
 	""")
-	print(f"IMPORT : Adding higher ranks")
+	mesologger.info(f"Adding higher ranks")
 	# Extract data from DuckDB into Polars
 	taxa_df = db.execute("""SELECT id_meso, name_consensus, parent_consensus, rank_consensus FROM meso""").pl()
-	print(f"IMPORT : Dataframe loaded into polars")
+	mesologger.info(f"Dataframe loaded into polars")
 	# Create initial ancestry dataframe (direct parent relationships)
 	ancestry = (
 		taxa_df.select(pl.col("id_meso").alias("child_id"),pl.col("parent_consensus").alias("parent_id"))
@@ -778,8 +777,8 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 			   .with_columns(pl.lit(1).alias("level")))
 	# Store all ancestry relationships
 	complete_ancestry = ancestry.clone()
-	print(f"IMPORT : Matched initial parent/child relationships")
-	if settings.VERBOSE: print(complete_ancestry)
+	mesologger.info(f"Matched initial parent/child relationships")
+	if settings.VERBOSE: mesologger.debug(complete_ancestry)
 	# Iteratively build the full ancestry chain
 	max_level = 20
 	for level in range(2, max_level + 1):
@@ -790,34 +789,34 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 				.filter(pl.col("parent_id").is_not_null()))
 		# Stop if no more parents found
 		if next_level.height == 0:
-			print(f"IMPORT : Max hierarchy depth {level-1} reached")
+			mesologger.info(f"Max hierarchy depth {level-1} reached")
 			break
 		# Add to complete ancestry
 		complete_ancestry = pl.concat([complete_ancestry, next_level])
 		# Set up for next iteration
 		ancestry = next_level
-	print(f"IMPORT : Expanded to complete ancestry chain")
-	if settings.VERBOSE: print(complete_ancestry)	
+	mesologger.info(f"Expanded to complete ancestry chain")
+	if settings.VERBOSE: mesologger.debug(complete_ancestry)	
 	# Join with taxa data to get names and ranks of all ancestors
-	print("IMPORT : Adding taxonomic information")
+	mesologger.info("Adding taxonomic information")
 	ancestry_with_info = (
 		complete_ancestry.join(taxa_df.select("id_meso", "name_consensus", "rank_consensus"),left_on="parent_id",right_on="id_meso")
 			.select(pl.col("child_id"),pl.col("parent_id"),pl.col("level"),pl.col("name_consensus")
 			.alias("ancestor_name"),pl.col("rank_consensus").alias("ancestor_rank")))
 
-	print("IMPORT : Added names and ranks to ancestry chain")	
-	if settings.VERBOSE: print(ancestry_with_info)	
+	mesologger.info("Added names and ranks to ancestry chain")	
+	if settings.VERBOSE: mesologger.debug(ancestry_with_info)	
 	# For each requested higher rank, find the closest ancestor with that exact rank
 	results = {}
 	for rank in higher_ranks:
 		clean_rank = rank.replace('"', '')
 		rank_upper = clean_rank.upper()	
-		print(f"IMPORT : Processing {clean_rank}...")
+		mesologger.info(f"Processing {clean_rank}...")
 		# Get all ancestors of this specific rank
 		rank_ancestors = ancestry_with_info.filter(pl.col("ancestor_rank") == rank_upper)	
 		# If empty, skip this rank
 		if rank_ancestors.height == 0:
-			print(f"IMPORT : No ancestors found with rank {rank_upper}")
+			mesologger.info(f"No ancestors found with rank {rank_upper}")
 			continue
 		# For each taxon, get the closest ancestor of this rank (lowest level number)
 		rank_result = (
@@ -831,7 +830,7 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 	final_df = base_df
 	for rank, rank_df in results.items(): final_df = final_df.join(rank_df,on="child_id",how="left")
 	# Extract genus from name_consensus for species-level taxa missing genus
-	print("IMPORT : Extracting genus from species names")
+	mesologger.info("Extracting genus from species names")
 	final_df = final_df.join(
 		taxa_df.select(["id_meso", "name_consensus", "rank_consensus"]),
 		left_on="child_id", right_on="id_meso", how="left"
@@ -845,13 +844,13 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 		.otherwise(pl.col("genus"))
 		.alias("genus")
 	).drop(["name_consensus", "rank_consensus"])
-	print("IMPORT : Ancestry with all ranks complete")	
-	if settings.VERBOSE: print(final_df)	
+	mesologger.info("Ancestry with all ranks complete")	
+	if settings.VERBOSE: mesologger.debug(final_df)	
 	# Backfill missing ranks using mode of values from rows with same lower taxonomic ranks
 	# Get all ranks that actually exist in DF (eg phylum is missing in debug)
 	existing_ranks = [rank for rank in higher_ranks if rank.replace('"', '') in final_df.columns]
 	# Log
-	print(f"IMPORT : Backfilling missing higher ranks { ', '.join(existing_ranks)}")
+	mesologger.info(f"Backfilling missing higher ranks { ', '.join(existing_ranks)}")
 	# Process existing ranks from lowest to highest 
 	backfill_order = existing_ranks.copy()
 	backfill_order.reverse()  # Start with species, genus, etc.
@@ -878,8 +877,8 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 				)
 			# Drop temporary columns
 			final_df = final_df.drop([f"src_{higher}" for higher in [r.replace('"', '') for r in backfill_order[:i]]])
-	print("IMPORT : Backfilled missing ranks")	
-	if settings.VERBOSE: print(final_df)
+	mesologger.info("Backfilled missing ranks")	
+	if settings.VERBOSE: mesologger.debug(final_df)
 	# Add back to DuckDB
 	db.execute(f"""
 		-- Create columns (including those for which we might not have a dataframe in debug mode)
@@ -888,18 +887,18 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 			UPDATE meso SET {', '.join([f'{rank} = fd.{rank}' for rank in existing_ranks])}
 			FROM final_df fd WHERE meso.id_meso = fd.child_id
 	""")
-	print("IMPORT : Higher ranks added back to main table")
+	mesologger.info("Higher ranks added back to main table")
 	if settings.VERBOSE: db.sql('SELECT id_meso, source::VARCHAR, name_consensus, rank_consensus::VARCHAR, kingdom, phylum, class, "order", family, genus FROM meso WHERE parent_consensus IS NOT NULL').show(max_rows=100)
 	# Check for any non-kingdoms that don't have a phylum_consensus
 	result = db.sql(f"""SELECT source, kingdom, phylum, class, "order", family, genus, name_consensus, rank_consensus FROM meso WHERE rank_consensus != 'KINGDOM' AND phylum IS NULL""")
 	rows = result.fetchdf()
 	if len(rows) > 0:
-		print(f"IMPORT : Backbone still has {len(rows):,} rows without proper higher ranks")
+		mesologger.warning(f"Backbone still has {len(rows):,} rows without proper higher ranks")
 		if settings.VERBOSE: result.show(max_rows=200)
 
 # Decide which entries we want to create dedicated pages for
 def decide_acceptance(results: dict, db: duckdb.DuckDBPyConnection):
-	print(f"IMPORT : ############### Deciding acceptance ###############")
+	mesologger.info(f"############### Deciding acceptance ###############")
 	# TODO: Find more authorities or way to get Tropicos data
 	# DONE: See how we can handle fungi given that neither Mycobank nor Fungorum provide reliable taxon acceptance data (use CoL for now)
 	authorities = {
@@ -925,7 +924,7 @@ def decide_acceptance(results: dict, db: duckdb.DuckDBPyConnection):
 				UPDATE meso SET considered_synonym = list_append(considered_synonym, '{authority}') FROM {authority} a 
 				WHERE meso.kingdom = '{kingdom}' AND meso.{authority}_id = a.id_raw AND a.status_clean = 'synonym';
 			""")
-		print(f"IMPORT : Added {kingdom} acceptance from {len(authorities[kingdom])} authorit{'ies' if len(authorities[kingdom]) > 1 else 'y'} ({', '.join(authorities[kingdom])})")
+		mesologger.info(f"Added {kingdom} acceptance from {len(authorities[kingdom])} authorit{'ies' if len(authorities[kingdom]) > 1 else 'y'} ({', '.join(authorities[kingdom])})")
 		# Set synonym flag for all entries
 		db.execute(f"""UPDATE meso SET synonym = (list_any_value(considered_synonym) IS NOT NULL) WHERE kingdom = '{kingdom}';""")
 		# Also add wikidata acceptance for entries that have more than 6 wikipedia pages and aren't synonyms
@@ -934,17 +933,17 @@ def decide_acceptance(results: dict, db: duckdb.DuckDBPyConnection):
 		db.execute(f"""UPDATE meso SET accepted = TRUE WHERE list_any_value(accepted_by) IS NOT NULL AND kingdom = '{kingdom}' AND rank_consensus >= 'SPECIES'::taxon_rank_enum;""")
 		# db.sql(f"SELECT id_meso, name_consensus, accepted, synonym, accepted_by, considered_synonym FROM meso WHERE kingdom = '{kingdom}' AND rank_consensus < 'SPECIES'::taxon_rank_enum AND list_any_value(accepted_by) IS NOT NULL;").show(max_rows=200)	
 		# Log
-		print(f"""IMPORT : Accepted {db.sql(f"SELECT COUNT(*) FROM meso WHERE kingdom = '{kingdom}' AND accepted").fetchone()[0]:,} {kingdom} taxons""")
+		mesologger.info(f"""Accepted {db.sql(f"SELECT COUNT(*) FROM meso WHERE kingdom = '{kingdom}' AND accepted").fetchone()[0]:,} {kingdom} taxons""")
 		if settings.VERBOSE: db.sql(f"""SELECT id_meso, name_consensus, accepted_by FROM meso WHERE kingdom = '{kingdom}' AND accepted ORDER BY len(accepted_by) DESC""").show(max_rows=20)
 		reject_count = db.sql(f"SELECT COUNT(*) FROM meso WHERE kingdom = '{kingdom}' AND NOT accepted AND rank_consensus >= 'SPECIES'::taxon_rank_enum").fetchone()[0]
 		if settings.VERBOSE:
-			print(f"""IMPORT : Most popular of {reject_count:,} {kingdom} rejects:""")
+			mesologger.info(f"""Most popular of {reject_count:,} {kingdom} rejects:""")
 			db.sql(f"""SELECT id_meso, source, name_consensus, rank_consensus, accepted_by, wikidata_id, wikidata_pagecount FROM meso WHERE kingdom = '{kingdom}' AND NOT accepted AND rank_consensus >= 'SPECIES'::taxon_rank_enum ORDER BY wikidata_pagecount DESC LIMIT 20""").show(max_rows=20)
-		else: print(f"""IMPORT : Rejected {reject_count:,} {kingdom} taxons""")
+		else: mesologger.info(f"""Rejected {reject_count:,} {kingdom} taxons""")
 
 # Make sure we don't have any name duplicates, and consolidate all column data to the accepted taxon
 def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = False):
-	if not rerun: print(f"IMPORT : ############### De-Duplicating Names ###############")
+	if not rerun: mesologger.info(f"############### De-Duplicating Names ###############")
 	"""
 			Duplicate names are a source dataset quality issue, for example:
 			- WFO thinks there are multiple accepted 'Nepenthes distillatoria' or 'Andromeda oleifolia'
@@ -957,7 +956,7 @@ def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = Fal
 		WHERE accepted AND name_consensus IN (SELECT name_consensus FROM meso WHERE accepted GROUP BY name_consensus HAVING COUNT(*) > 1);
 	""")
 	initial_count = db.sql(f"SELECT COUNT(*) FROM meso WHERE accepted").fetchone()[0]	
-	print(f"IMPORT : Deduplicating {db.sql(f"SELECT COUNT(*) FROM meso WHERE dedupe").fetchone()[0]:,} non unique names")
+	mesologger.info(f"Deduplicating {db.sql(f"SELECT COUNT(*) FROM meso WHERE dedupe").fetchone()[0]:,} non unique names")
 	if settings.VERBOSE: 
 		db.sql(f"""
 			SELECT array_agg(id_meso), name_consensus, array_agg(source), {', '.join([f'array_agg({id}_id)' for id in core_authorities])}, array_agg(accepted_by), array_agg(considered_synonym), COUNT(*) as count 
@@ -972,7 +971,7 @@ def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = Fal
 		WHERE d.id_meso IN (SELECT id_meso FROM dupes d2 WHERE d2.name_consensus = d.name_consensus 
 		ORDER BY acceptance_count DESC, synonym_count ASC, year_consensus ASC LIMIT 1);
 	""")
-	print(f"IMPORT : Picked {db.sql(f"SELECT COUNT(*) FROM preferred_rows").fetchone()[0]:,} rows to use")
+	mesologger.info(f"Picked {db.sql(f"SELECT COUNT(*) FROM preferred_rows").fetchone()[0]:,} rows to use")
 	# Create backfill values
 	extra_mode_values = ['wikipedia_page','iucn_status','common_name','wikicommons','wikispecies','bhl_page','qauthor'] + higher_ranks
 	db.execute(f"""
@@ -999,7 +998,7 @@ def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = Fal
 			list_distinct(flatten(array_agg(regions))) AS regions
 		FROM dupes GROUP BY name_consensus;
 	""")
-	print(f"IMPORT : Collected backfill values")
+	mesologger.info(f"Collected backfill values")
 	if settings.VERBOSE: db.sql("SELECT * FROM backfill_values").show(max_rows=50)
 	# Unset accepted for all and then reset for preferred rows and consolidate values
 	db.execute(f"""
@@ -1040,7 +1039,7 @@ def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = Fal
 		DROP TABLE preferred_rows;
 	""")
 	reduced_name_count = db.sql(f"SELECT COUNT(*) FROM meso WHERE accepted").fetchone()[0]
-	print(f"""IMPORT : Reduced {initial_count:,} rows to {reduced_name_count:,} by consolidating {int(initial_count-reduced_name_count):,} name duplicates""")
+	mesologger.info(f"""Reduced {initial_count:,} rows to {reduced_name_count:,} by consolidating {int(initial_count-reduced_name_count):,} name duplicates""")
 	# Duplicate names with arrays of all ranks and years (including duplicates)
 	rows = db.execute(f"""
 		SELECT name_consensus FROM meso m WHERE accepted AND name_consensus IN (SELECT name_consensus FROM meso 
@@ -1048,12 +1047,12 @@ def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = Fal
 	""").fetchall()
 	# Log any duplicates
 	if len(rows) > 0: 
-		print(f"""IMPORT : Warning, still found duplicate names:""")
+		mesologger.info(f"""Warning, still found duplicate names:""")
 		rows.show(max_rows=40)
 
 # Vote on parents and then add child count to each column
 def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
-	print(f"IMPORT : ############### Consolidating parents ###############")
+	mesologger.info(f"############### Consolidating parents ###############")
 	previous_count = 0
 	# Accept parents
 	while True:
@@ -1067,7 +1066,7 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		""")
 		current_count = len(rows)
 		if rows and current_count > 0: 
-			print(f"IMPORT : Looking for {current_count:,} parents")
+			mesologger.info(f"Looking for {current_count:,} parents")
 			# Log if needed
 			if settings.VERBOSE: rows.show()
 		# Stop when we have no more candidates	
@@ -1085,7 +1084,7 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		""")
 		# Remember count for next round
 		previous_count = current_count
-	print("IMPORT : Accepted all parents we could find recursively")
+	mesologger.info("Accepted all parents we could find recursively")
 	# Dedupe parents
 	db.execute(f"""
 		-- First create a temp table for duplicated parents
@@ -1113,7 +1112,7 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		DROP TABLE duplicated_parents;
 		DROP TABLE non_canonical_parents;
 	""")
-	print("IMPORT : Deduplicated parentage")
+	mesologger.info("Deduplicated parentage")
 	# Run dedupe names again
 	dedupe_names(results,db,True)
 	# Create accepted IDs / names temp table to reuse / speed up
@@ -1128,7 +1127,7 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		WHERE m.accepted;
 	""")
 	# Log 
-	print(f"""IMPORT : Built lookup table with all {db.execute("SELECT COUNT(*) FROM accepted_rows;").fetchone()[0]:,} accepted rows""")
+	mesologger.info(f"""Built lookup table with all {db.execute("SELECT COUNT(*) FROM accepted_rows;").fetchone()[0]:,} accepted rows""")
 	if settings.VERBOSE: db.sql("SELECT * FROM accepted_rows;").show()
 	# Remove all dangling parents (parents whose IDs are not in our accepted taxon list)
 	result = db.execute(f"""
@@ -1137,7 +1136,7 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 			AND parent_consensus NOT IN (SELECT id_meso FROM accepted_rows)
 		RETURNING 1;
 	""").fetchall()
-	print(f"IMPORT : Removed {len(result):,} dangling parent references")
+	mesologger.info(f"Removed {len(result):,} dangling parent references")
 	# Try adding missing parents via name
 	result = db.execute(f"""
 		UPDATE meso m SET parent_consensus = ar2.id_meso
@@ -1148,7 +1147,7 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		AND ar1.id_meso = m.id_meso
 		RETURNING 1;
 	""").fetchall()
-	print(f"IMPORT : Found {len(result):,} missing parents by name match")
+	mesologger.info(f"Found {len(result):,} missing parents by name match")
 	# Add child count, if it's larger than a usmallint something's broken
 	db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS child_count USMALLINT;""")
 	db.execute(f"""
@@ -1156,12 +1155,12 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		UPDATE meso SET child_count = COALESCE(cc.child_count, 0) FROM child_counts cc WHERE meso.id_meso = cc.parent_consensus;
 	""")
 	# Log
-	print(f"""IMPORT : Counted children of {db.execute("SELECT COUNT(*) FROM meso WHERE child_count > 0;").fetchone()[0]:,} parental rows""")
+	mesologger.info(f"""Counted children of {db.execute("SELECT COUNT(*) FROM meso WHERE child_count > 0;").fetchone()[0]:,} parental rows""")
 	if settings.VERBOSE: db.sql("SELECT id_meso, source, name_consensus, child_count FROM meso ORDER BY child_count DESC LIMIT 20;").show()
 
 # Carefully add any potential missing name matches from GBIF, NCBI etc, ie sources that we use for climate and research, as well as missing parents after cleaning them up
 def polish(results: dict, db: duckdb.DuckDBPyConnection):
-	print(f"IMPORT : ############### Polishing results ###############")
+	mesologger.info(f"############### Polishing results ###############")
 	# Add missing GBIF / NCBI IDs by name
 	# Those two are essentials we derive obeservations and thus climate from GBIF, and all protein lookups from NCBI
 	for source in ['gbif','ncbi']:
@@ -1172,7 +1171,7 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 			AND {source}_id NOT IN (SELECT DISTINCT id_raw FROM {source})
 			RETURNING 1;
 		""").fetchall()
-		print(f"IMPORT : Nulled {len(result):,} obsolete {source.upper()} IDs")
+		mesologger.info(f"Nulled {len(result):,} obsolete {source.upper()} IDs")
 		# GBIF special cases as we have accepted etc metadata (NCBI is name and ID only)
 		if source == 'gbif':
 			# Replace outdated GBIF IDs with current accepted ones 
@@ -1195,7 +1194,7 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 			""").fetchall()
 			# Clean up
 			db.execute("DROP TABLE name_accepted")
-			print(f"IMPORT : Updated {len(result):,} outdated {source.upper()} IDs to their accepted value")
+			mesologger.info(f"Updated {len(result):,} outdated {source.upper()} IDs to their accepted value")
 			# Add accepted GBIF IDs to remaining NULL rows first
 			result = db.execute(f"""
 				UPDATE meso SET {source}_id = (
@@ -1208,7 +1207,7 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 				AND meso.{source}_id IS NULL 
 				RETURNING 1;
 			""").fetchall()
-			print(f"IMPORT : Added {len(result):,} accepted {source.upper()} IDs by name matching")
+			mesologger.info(f"Added {len(result):,} accepted {source.upper()} IDs by name matching")
 		# Try adding the remaining IDs we might have
 		result = db.execute(f"""
 			UPDATE meso SET {source}_id = (
@@ -1220,10 +1219,10 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 			AND meso.{source}_id IS NULL 
 			RETURNING 1;
 		""").fetchall()
-		print(f"IMPORT : Added {len(result):,} {source.upper()} IDs by name matching")
+		mesologger.info(f"Added {len(result):,} {source.upper()} IDs by name matching")
 	# Truncate WFO IDs to 14 characters
 	db.execute("UPDATE meso SET wfo_id = LEFT(wfo_id, 14) WHERE LENGTH(wfo_id) > 14;")
-	print(f"IMPORT : Truncated WFO IDs to 14 characters")
+	mesologger.info(f"Truncated WFO IDs to 14 characters")
 
 # Final validation
 def validate(results: dict, db: duckdb.DuckDBPyConnection):
@@ -1243,7 +1242,7 @@ def validate(results: dict, db: duckdb.DuckDBPyConnection):
 	""")
 	# Log any duplicates
 	if len(rows) > 0:
-		print(f"IMPORT : {len(rows):,} duplicates accepted")
+		mesologger.info(f"{len(rows):,} duplicates accepted")
 		if settings.VERBOSE: rows.show(max_rows=40)
 
 def package_release(results: dict, db: duckdb.DuckDBPyConnection):
@@ -1258,16 +1257,16 @@ def package_release(results: dict, db: duckdb.DuckDBPyConnection):
 	most_recent = max(int(val.get('latest_processed', '').split('.')[1]) for val in sorted_results.values()  if val.get('latest_processed', ''))
 	release = f"{ most_recent }-{ hash }"
 	# Start packaging release
-	print(f"IMPORT : ############### Packaging Release ###############")
+	mesologger.info(f"############### Packaging Release ###############")
 	# Check if we already have that release
 	if check_release(release):
 		# Abort if we're not forcing it
 		if not settings.FORCE:
-			print(f"IMPORT : Release directory { release } already exists, use flag -f to overwrite")
+			mesologger.info(f"Release directory { release } already exists, use flag -f to overwrite")
 			return
 		# Otherwise remove the existing dir
 		else:
-			print(f"IMPORT : Deleting existing release { release }")
+			mesologger.info(f"Deleting existing release { release }")
 			storage.rmtree(os.path.join(RELEASES_DIR, release))
 	# Create release directory
 	release_dir = os.path.join(RELEASES_DIR, release)
@@ -1278,7 +1277,7 @@ def package_release(results: dict, db: duckdb.DuckDBPyConnection):
 	for result in results: 
 		processed_file = os.path.join(PROCESSED_DIR,results[result].get('latest_processed'))
 		target_file = os.path.join(release_dir, results[result].get('latest_processed'))
-		print(f"IMPORT : Copying { processed_file } to { target_file }")
+		mesologger.info(f"Copying { processed_file } to { target_file }")
 		storage.copy(processed_file, target_file)
 	# Load latest run-state manifest for source metadata enrichment
 	state_manifest = load_state()
@@ -1312,7 +1311,7 @@ def package_release(results: dict, db: duckdb.DuckDBPyConnection):
 def load_parquet(results: dict, db: duckdb.DuckDBPyConnection, source: str):
 	parquet = db.read_parquet(storage.parquet_url(os.path.join(PROCESSED_DIR, results[source].get('latest_processed'))))
 	db.execute(f"CREATE TEMP TABLE {source} AS SELECT * FROM parquet")
-	print(f"IMPORT : Loaded {source} data into memory / temp table")
+	mesologger.info(f"Loaded {source} data into memory / temp table")
 	if settings.VERBOSE: db.sql(f"SUMMARIZE {source}").show(max_rows=40)
 
 # Load values from multiple sources and pick the most common, with ordinality as tie breaker 
@@ -1348,7 +1347,7 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 				result = db.sql(f"SELECT id_raw, name_clean FROM {authority} WHERE len(string_split(name_clean,' ')) > 3 AND NOT contains(name_clean, '''');")
 				rowcount = result.arrow().read_all().num_rows
 				if rowcount > 0:
-					print(f"IMPORT : Disqualified {rowcount:,} names from {authority}")
+					mesologger.info(f"Disqualified {rowcount:,} names from {authority}")
 					if settings.VERBOSE: result.show(max_rows=20)
 			case 'parent_raw':
 				# Replace respective IDs with their meso ID, fastest as measured in commit bbea297
@@ -1359,7 +1358,7 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 					)
 					WHERE EXISTS (SELECT 1 FROM {authority} WHERE parent_raw IS NOT NULL AND id_raw = meso.{authority}_id);
 				""")
-				print(f"IMPORT : Fetched Meso IDs of {authority} parents")
+				mesologger.info(f"Fetched Meso IDs of {authority} parents")
 			case 'rank_clean':
 				# Uppercase rank values to match our enum and skip values outside enum labels
 				db.execute(f"""
@@ -1377,7 +1376,7 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 				""")
 				rowcount = result.arrow().read_all().num_rows
 				if rowcount > 0:
-					print(f"IMPORT : Skipped {rowcount:,} invalid ranks from {authority}")
+					mesologger.info(f"Skipped {rowcount:,} invalid ranks from {authority}")
 					if settings.VERBOSE: result.show(max_rows=20)
 			case 'year':
 				# Only set year values that are between 1700 and current year
@@ -1388,15 +1387,15 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 				result = db.sql(f"SELECT id_raw, name_clean, {column} FROM {authority} WHERE {column} < 1700 OR {column} > EXTRACT(YEAR FROM CURRENT_DATE);")
 				rowcount = result.arrow().read_all().num_rows
 				if rowcount > 0:
-					print(f"IMPORT : Skipped {rowcount:,} invalid years from {authority}")
+					mesologger.info(f"Skipped {rowcount:,} invalid years from {authority}")
 					if settings.VERBOSE: result.show(max_rows=20)
 			case _:
 				# Just add all source columns
 				db.execute(f"""UPDATE meso m SET {fieldname}_{authority} = a.{column} FROM {authority} a WHERE m.{authority}_id = a.id_raw;""")
-	print(f"IMPORT : Candidates for {column} loaded from {len(pool)} authorities ({', '.join(pool)})")
+	mesologger.info(f"Candidates for {column} loaded from {len(pool)} authorities ({', '.join(pool)})")
 	# Add columns to pool, the order also determines tie-breaking hierarchy (earlier values will take precedence)
 	db.execute(f"""UPDATE meso SET {fieldname}_pool = [{', '.join([f'{fieldname}_{authority}' for authority in pool])}]""")
-	print(f"IMPORT : Built candidate pool for {column} consensus")
+	mesologger.info(f"Built candidate pool for {column} consensus")
 	# Pick winner and trim it while we're at it
 	if not column_types.get(column): db.execute(f"""UPDATE meso SET {fieldname}_consensus = trim(list_mode({fieldname}_pool));""")
 	# Don't try trimming USMALLINTS,BOOLEAN etc
@@ -1414,7 +1413,7 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 		""")
 	rowcount = result.arrow().read_all().num_rows
 	if rowcount > 0:
-		print(f"IMPORT : Voted on {rowcount:,} ambiguous {column} values")
+		mesologger.info(f"Voted on {rowcount:,} ambiguous {column} values")
 		if settings.VERBOSE: result.show(max_rows=20)
 	# Cleanup 
 	for authority in pool: db.execute(f"""ALTER TABLE meso DROP COLUMN IF EXISTS {fieldname}_{authority}""")
@@ -1426,7 +1425,7 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 			result = db.sql(f"SELECT source, {'_id, '.join([f'{authority}' for authority in pool])}_id, name_clean FROM meso WHERE name_consensus IS NULL;")
 			rowcount = result.arrow().read_all().num_rows
 			if rowcount > 0:
-				print(f"IMPORT : Falling back on original name_clean in {rowcount:,} cases where we didn't find any consensus candidates")
+				mesologger.warning(f"Falling back on original name_clean in {rowcount:,} cases where we didn't find any consensus candidates")
 				if settings.VERBOSE: result.show(max_rows=40)
 				# Use existing name_clean instead
 				db.execute(f"""UPDATE meso SET name_consensus = name_clean WHERE name_consensus IS NULL""")
@@ -1449,7 +1448,7 @@ uuid_count = 0
 def uuid_v5_udf(scalars: pa.StringArray):
 	global uuid_count
 	uuid_count += 2048
-	print(f"\rIMPORT : Hashed {uuid_count:,} UUIDs", end="")
+	mesologger.info(f"Hashed {uuid_count:,} UUIDs", extra={'sameline': True})
 	return [str(uuid.uuid5(settings.HASH_NAMESPACE, s.as_buffer().to_pybytes())) for s in scalars]
 
 # Duckdb UDF using polars zero copied from and to arrows
@@ -1473,5 +1472,5 @@ def vernacular_udf(data: pa.StructArray) -> pa.Array:
 		# Extract values of reduced order list back into list
 		.list.eval(pl.element().struct[0])
 	])
-	print(f"\rIMPORT : Processed {vernacular_count:,} complex rows with polars", end="")
+	mesologger.info(f"Processed {vernacular_count:,} complex rows with polars", extra={'sameline': True})
 	return result["names"].to_arrow()

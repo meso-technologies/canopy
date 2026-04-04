@@ -8,6 +8,7 @@
 # TODO: https://www.iucnredlist.org/species/120941671/120980128
 
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -26,7 +27,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_iucn(session):
-	print(f"IMPORT : ############### Starting IUCN Update  ###############")
+	mesologger.info(f"############### Starting IUCN Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_iucn(source)
@@ -35,7 +36,7 @@ async def update_iucn(session):
 
 # Process a fresh sourcefile
 def process_iucn(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...")  
+	mesologger.info(f"Starting to process { source['latest_download'] }...")  
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -73,7 +74,7 @@ def process_iucn(source: dict):
 				);
 		""")
 		# Log
-		print(f"IMPORT : Loaded { db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants and fungi from { source['name'] } csv")
+		mesologger.info(f"Loaded { db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants and fungi from { source['name'] } csv")
 		# Remove author from name first
 		strip_author_from_name(db,source)
 		# We shouldn't have many hybrids but still run this to remove '×'s from name_clean
@@ -158,7 +159,7 @@ def iucn_vernacular(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 		""").fetchone()[0]
 
 		# Log
-		if rows and rows > 0: print(f"IMPORT : Added vernacular names to {rows:,} IUCN entries")
+		if rows and rows > 0: mesologger.info(f"Added vernacular names to {rows:,} IUCN entries")
 
 	finally:
 		# Clean up temporary tables
@@ -193,4 +194,4 @@ def iucn_status(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 		SELECT COUNT(*) FROM iucn WHERE iucn_status IS NOT NULL
 	""").fetchone()[0]
 	# Log 
-	if rows and rows > 0: print(f"IMPORT : Added iucn_status to { rows } items")
+	if rows and rows > 0: mesologger.info(f"Added iucn_status to { rows } items")

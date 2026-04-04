@@ -4,6 +4,7 @@
 #
 #		Highlights: Used to look up proteins
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -22,7 +23,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_ncbi(session):
-	print(f"IMPORT : ############### Starting NCBI Update  ###############")
+	mesologger.info(f"############### Starting NCBI Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_ncbi(source)
@@ -31,7 +32,7 @@ async def update_ncbi(session):
 
 # Process a fresh sourcefile
 def process_ncbi(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
+	mesologger.info(f"Starting to process { source['latest_download'] }...") 
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb

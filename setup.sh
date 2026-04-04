@@ -41,6 +41,57 @@ resolve_winget() {
 	return 1
 }
 
+install_with_platform_package_manager() {
+	local pkg="$1"
+	local winget_id="${2:-}"
+	if is_windows_shell; then
+		local winget_cmd=""
+		if winget_cmd="$(resolve_winget)"; then
+			if [[ -n "$winget_id" ]]; then
+				"$winget_cmd" install --id="$winget_id" -e --accept-package-agreements --accept-source-agreements || true
+			else
+				"$winget_cmd" install --name "$pkg" --accept-package-agreements --accept-source-agreements || true
+			fi
+		fi
+	elif [[ "$(uname -s)" == "Darwin" ]]; then
+		if command -v brew >/dev/null 2>&1; then
+			brew install "$pkg" || true
+		fi
+	else
+		if command -v apt-get >/dev/null 2>&1; then
+			sudo apt-get update || true
+			sudo apt-get install -y "$pkg" || true
+		elif command -v dnf >/dev/null 2>&1; then
+			sudo dnf install -y "$pkg" || true
+		elif command -v yum >/dev/null 2>&1; then
+			sudo yum install -y "$pkg" || true
+		elif command -v pacman >/dev/null 2>&1; then
+			sudo pacman -Sy --noconfirm "$pkg" || true
+		elif command -v zypper >/dev/null 2>&1; then
+			sudo zypper --non-interactive install "$pkg" || true
+		fi
+	fi
+}
+
+ensure_command() {
+	local cmd="$1"
+	local pkg="$2"
+	local winget_id="${3:-}"
+	if command -v "$cmd" >/dev/null 2>&1; then
+		echo "CANOPY : Using $cmd at $(command -v "$cmd")"
+		return 0
+	fi
+	echo "CANOPY : $cmd not found, attempting install"
+	install_with_platform_package_manager "$pkg" "$winget_id"
+	if command -v "$cmd" >/dev/null 2>&1; then
+		echo "CANOPY : Installed $cmd at $(command -v "$cmd")"
+		return 0
+	fi
+	echo "CANOPY : unable to install $cmd automatically"
+	echo "CANOPY : install it manually and rerun setup.sh"
+	exit 1
+}
+
 ensure_uv() {
 	if resolve_uv; then
 		echo "CANOPY : Using uv at $UV_BIN"
@@ -91,6 +142,12 @@ echo "CANOPY : Starting standalone setup in $CANOPY_DIR"
 cd "$CANOPY_DIR"
 
 ensure_uv
+# Ensure aria2 is available for parallel dataset downloads
+ensure_command "aria2c" "aria2" "aria2.aria2"
+# Ensure ripgrep is available for large wikidata prefilter operations
+ensure_command "rg" "ripgrep" "BurntSushi.ripgrep.MSVC"
+# Ensure pigz is available for parallel gzip chunk processing
+ensure_command "pigz" "pigz"
 
 if "$UV_BIN" venv --python 3.13 --allow-existing .venv >/dev/null 2>&1; then
 	echo "CANOPY : Created or reused .venv with Python 3.13"

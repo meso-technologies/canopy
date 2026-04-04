@@ -1,6 +1,7 @@
 # Keep download-related helpers centralized for all dataset handlers
 
 # Load async HTTP client, async file writes, SSL, filesystem, and regex helpers
+from .log import mesologger
 import aiohttp, aiofiles, ssl, os, re
 # Load datetime parsing for Last-Modified headers
 from datetime import datetime
@@ -33,17 +34,17 @@ async def pull(session: aiohttp.ClientSession, source: dict) -> bool:
 		# Use Last-Modified (or fallback range request) for regular hosts
 		else: source['timestamp_remote'] = await get_timestamp_remote(source)
 	# Log when remote timestamp could not be determined
-	if source['timestamp_remote'] == 0: print(f"IMPORT : Unable to get a valid remote timestamp for { source['name'] }")
+	if source['timestamp_remote'] == 0: mesologger.warning(f"Unable to get a valid remote timestamp for { source['name'] }")
 	# Log comparison details when both local and remote timestamps are available
 	elif all([source.get('timestamp_local'), source.get('timestamp_remote')]):
 		# Report newly available remote version
-		if source['timestamp_remote'] > source['timestamp_local']: print(f"IMPORT : New remote version { source['timestamp_remote'] } of { source['name'] } available.")
+		if source['timestamp_remote'] > source['timestamp_local']: mesologger.info(f"New remote version { source['timestamp_remote'] } of { source['name'] } available.")
 		# Report up-to-date local cache state
-		elif source['timestamp_remote'] == source['timestamp_local']: print(f"IMPORT : Latest remote version { source['timestamp_remote'] } of { source['name'] } matches local { source['timestamp_local'] }")
+		elif source['timestamp_remote'] == source['timestamp_local']: mesologger.info(f"Latest remote version { source['timestamp_remote'] } of { source['name'] } matches local { source['timestamp_local'] }")
 		# Report unexpected remote rollback state
-		elif source['timestamp_remote'] < source['timestamp_local']: print(f"IMPORT : Latest remote version { source['timestamp_remote'] } of { source['name'] } older than local { source['timestamp_local'] }")
+		elif source['timestamp_remote'] < source['timestamp_local']: mesologger.info(f"Latest remote version { source['timestamp_remote'] } of { source['name'] } older than local { source['timestamp_local'] }")
 	# Log remote timestamp when no local baseline exists yet
-	else: print(f"IMPORT : Latest remote version of { source['name'] } is from { source['timestamp_remote'] }")
+	else: mesologger.info(f"Latest remote version of { source['name'] } is from { source['timestamp_remote'] }")
 	# Download when no local file exists or remote version is newer
 	if not source.get('latest_download') or source['timestamp_remote'] > source['timestamp_local']:
 		# Start file download and capture status code
@@ -67,14 +68,14 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 		target_file = f"{ filename }.{ datehash }{ source.get('suffix') or PurePath(url).suffix or '.zip' }"
 		# Build full destination path inside canopy source dir
 		target_path = f"{ SRC_DIR }/{ target_file }"
-		# Route to aria2 for sources configured with multi-connection downloads
+		# Route to aria-style parallel downloads for sources with connection hints
 		if 'use_aria' in source and isinstance(source['use_aria'], int):
-			# Stream large throttled Wikidata archive directly to S3 when S3 backend is active
-			if storage.is_s3() and source.get('name') == 'wikidata':
+			# Stream directly to S3 with parallel ranged workers when S3 backend is active
+			if storage.is_s3():
 				# Build destination key under source prefix
 				target_key = f"source/{target_file}"
-				# Stream HTTP response into multipart S3 upload
-				await storage.stream_to_s3(url, target_key, session)
+				# Stream HTTP response into multipart S3 upload using source parallelism hint
+				await storage.stream_to_s3_parallel(url, target_key, session, source['use_aria'])
 				# Delete older source versions after successful streamed upload
 				delete_older_files(filename, datehash, SRC_DIR)
 				# Store downloaded timestamp for downstream processing checks
@@ -83,14 +84,10 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 				source['latest_download'] = target_file
 				# Return synthetic HTTP-like success status for streamed path
 				return 200
-			# Execute aria2 download with configured connection count
+			# Execute aria2 download with configured connection count in local mode
 			success = await aria_download(target_file, url, source['use_aria'])
 			# Abort when aria2 download failed
 			if not success: return None
-			# Upload completed local file to S3 when S3 backend is active
-			if storage.is_s3(): storage.upload(target_path, f"source/{target_file}")
-			# Remove local file after successful S3 upload in download-only mode
-			if storage.is_s3() and settings.DOWNLOAD_ONLY and os.path.isfile(target_path): os.remove(target_path)
 			# Keep placeholder branch for future aria-specific timestamp extraction
 			if not datehash:
 				# No-op for now because datehash is expected from remote timestamp lookup
@@ -110,13 +107,13 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 				# Open destination file in binary write mode
 				async with aiofiles.open(target_path, mode='wb') as file:
 					# Log download start details
-					print(f"IMPORT : Downloading { filename } from { url }")
+					mesologger.info(f"Downloading { filename } from { url }")
 					# Read full response payload into memory (legacy behavior)
 					data = await response.read()
 					# Backfill datehash from response headers when needed
 					if not datehash: datehash = get_datehash_from_response(response)
 					# Log write target filename
-					print(f"IMPORT : Writing { target_file }")
+					mesologger.info(f"Writing { target_file }")
 					# Persist payload to local source file
 					await file.write(data)
 					# Upload completed local file to S3 when S3 backend is active
@@ -132,11 +129,11 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 					# Return HTTP response status for success/failure handling upstream
 					return response.status
 	# Handle missing header-related cases explicitly
-	except KeyError as e: print(f"IMPORT : Unable to get { e } Header, skipping download of { filename }.")
+	except KeyError as e: mesologger.error(f"Unable to get { e } Header, skipping download of { filename }.")
 	# Catch all other download failures and keep pipeline alive
 	except Exception as e:
 		# Log unexpected exception details for debugging
-		print(f"IMPORT : Unhandled file download exception {type(e).__name__ } { e }.")
+		mesologger.error(f"Unhandled file download exception {type(e).__name__ } { e }.")
 
 # Ensure aria-managed source files are complete before processing stage
 async def aria_ready(source: dict, dir: str | None = None) -> bool:
@@ -145,7 +142,7 @@ async def aria_ready(source: dict, dir: str | None = None) -> bool:
 	# Abort when source state does not include latest downloaded filename
 	if not source.get('latest_download'):
 		# Log missing source filename state for diagnostics
-		print(f"IMPORT : aria_ready missing latest_download for {source.get('name', 'unknown source')}")
+		mesologger.info(f"aria_ready missing latest_download for {source.get('name', 'unknown source')}")
 		# Return False so caller skips processing
 		return False
 	# Build expected file path
@@ -163,17 +160,17 @@ async def aria_ready(source: dict, dir: str | None = None) -> bool:
 	# Resume download when aria sidecar indicates partial state
 	if os.path.isfile(sidecar_path):
 		# Log resume attempt for operator visibility
-		print(f"IMPORT : Found aria2 sidecar for {source['latest_download']}, resuming download")
+		mesologger.info(f"Found aria2 sidecar for {source['latest_download']}, resuming download")
 		# Resume using dataset-specific connection settings
 		success = await aria_download(source['latest_download'], source['url'], source.get('use_aria') or 4, dir)
 		# Retry once after deleting stale sidecar when first resume fails
 		if not success:
 			# Log stale-sidecar recovery path
-			print(f"IMPORT : Resume failed for {source['latest_download']}, removing stale sidecar and retrying once")
+			mesologger.error(f"Resume failed for {source['latest_download']}, removing stale sidecar and retrying once")
 			# Remove stale sidecar to clear broken aria state
 			try: os.remove(sidecar_path)
 			# Log sidecar cleanup failure but continue retry attempt
-			except Exception as e: print(f"IMPORT : Unable to remove stale aria2 sidecar {sidecar_path} {type(e).__name__ } { e }")
+			except Exception as e: mesologger.info(f"Unable to remove stale aria2 sidecar {sidecar_path} {type(e).__name__ } { e }")
 			# Retry resume once after stale sidecar cleanup
 			success = await aria_download(source['latest_download'], source['url'], source.get('use_aria') or 4, dir)
 			# Abort when retry still fails
@@ -181,13 +178,13 @@ async def aria_ready(source: dict, dir: str | None = None) -> bool:
 	# Abort when expected source file is still missing after resume checks
 	if not os.path.isfile(file_path):
 		# Log missing file state for diagnostics
-		print(f"IMPORT : aria_ready missing source file {file_path}")
+		mesologger.info(f"aria_ready missing source file {file_path}")
 		# Return False so caller skips processing
 		return False
 	# Abort when source file exists but is empty
 	if os.path.getsize(file_path) == 0:
 		# Log zero-byte file state for diagnostics
-		print(f"IMPORT : aria_ready source file has 0 bytes {file_path}")
+		mesologger.info(f"aria_ready source file has 0 bytes {file_path}")
 		# Return False so caller skips processing
 		return False
 	# Return True when aria-managed file is present and non-empty
@@ -198,7 +195,7 @@ async def aria_download(filename: str, url: str, connections: int, dir: str | No
 	# Default to canopy source directory when caller did not override
 	if not dir: dir = SRC_DIR
 	# Log aria invocation details for operator visibility
-	print(f"IMPORT : Downloading { filename } from { url } using aria2 with { connections } connections to {dir}")
+	mesologger.info(f"Downloading { filename } from { url } using aria2 with { connections } connections to {dir}")
 	# Import asyncio locally to preserve existing structure
 	import asyncio
 	# Build aria2 command with resume support and periodic progress summaries
@@ -227,7 +224,7 @@ async def aria_download(filename: str, url: str, connections: int, dir: str | No
 			# Print only progress/notice lines that help operators monitor downloads
 			if ('[#' in line_str and 'DL:' in line_str and 'CN:' in line_str) or 'NOTICE' in line_str:
 				# Emit aria progress line with filename context
-				print(f"IMPORT : ARIA2 progress for { filename } { line_str }")
+				mesologger.info(f"ARIA2 progress for { filename } { line_str }")
 	# Wait until aria process exits
 	await process.wait()
 	# Capture final process exit code
@@ -239,7 +236,7 @@ async def aria_download(filename: str, url: str, connections: int, dir: str | No
 		# Join selected lines into readable multiline block
 		error_str = "\n".join(last_errors)
 		# Log aria exit code and tail of stderr output
-		print(f"IMPORT : aria2c failed with exit code { exit_code }:\n{ error_str }")
+		mesologger.error(f"aria2c failed with exit code { exit_code }:\n{ error_str }")
 		# Return None/False-equivalent for failure branch compatibility
 		return None
 	# Sleep briefly so file buffers are fully flushed before downstream checks
@@ -266,7 +263,7 @@ def get_local_source_file(starts_with: str) -> str | None:
 				# Remove zero-byte leftovers from interrupted downloads
 				if os.path.getsize(file_path) == 0:
 					# Log and delete empty file so it cannot poison timestamp selection
-					print(f"IMPORT : {file_path} has 0 bytes, ignoring and deleting")
+					mesologger.info(f"{file_path} has 0 bytes, ignoring and deleting")
 					# Delete empty file artifact
 					os.remove(file_path)
 					# Continue scanning other candidate files
@@ -292,8 +289,10 @@ def get_local_source_file(starts_with: str) -> str | None:
 async def get_timestamp_remote(source: dict) -> int:
 	# Keep this request short because it only fetches metadata
 	timeout = aiohttp.ClientTimeout(30)
+	# Build optional user-agent header for remote timestamp probes
+	headers = {'User-Agent': settings.HTTP_USER_AGENT} if settings.HTTP_USER_AGENT else None
 	# Use a dedicated short-lived session for timestamp checks
-	async with aiohttp.ClientSession(timeout=timeout) as session:
+	async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
 		# Try HEAD request first for cheapest metadata lookup
 		response = await session.head(source['url'], ssl=ssl.SSLContext(), allow_redirects=True)
 		# Return parsed datehash when HEAD succeeded
@@ -309,8 +308,10 @@ async def get_timestamp_remote(source: dict) -> int:
 
 # Resolve ChecklistBank dataset timestamp/citation from metadata endpoint
 async def get_timestamp_checklistbank(session: aiohttp.ClientSession, source: dict):
+	# Build optional user-agent header for ChecklistBank metadata requests
+	headers = {'User-Agent': settings.HTTP_USER_AGENT} if settings.HTTP_USER_AGENT else None
 	# Query checklist dataset metadata endpoint derived from download URL
-	async with aiohttp.ClientSession() as session, session.get(source['url'].rsplit('/', 1)[0]) as response:
+	async with aiohttp.ClientSession(headers=headers) as session, session.get(source['url'].rsplit('/', 1)[0]) as response:
 		# Parse metadata response only when request succeeded
 		if response.status == 200:
 			# Decode JSON metadata payload
@@ -322,7 +323,7 @@ async def get_timestamp_checklistbank(session: aiohttp.ClientSession, source: di
 		# Log metadata request failures for diagnostics
 		else:
 			# Report HTTP status for failed metadata lookup
-			print(f"IMPORT: Error fetching { source['name'] } ChecklistBank version XML {response.status}")
+			mesologger.error(f" Error fetching { source['name'] } ChecklistBank version XML {response.status}")
 
 # Parse Last-Modified header into YYYYMMDD integer datehash
 def get_datehash_from_response(response: aiohttp.ClientResponse) -> int:
@@ -335,4 +336,4 @@ def get_datehash_from_response(response: aiohttp.ClientResponse) -> int:
 	# Log missing timestamp header for diagnostics
 	else:
 		# Report missing Last-Modified header values to help source debugging
-		print(f"IMPORT : Unable to find Last-Modified in Headers { response.headers }.")
+		mesologger.info(f"Unable to find Last-Modified in Headers { response.headers }.")

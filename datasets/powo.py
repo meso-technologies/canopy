@@ -12,6 +12,7 @@
 #		TODO: Extract full lifeform/climate from dynamicProperties beyond boolean annual/perennial
 #
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -31,7 +32,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_powo(session):
-	print(f"IMPORT : ############### Starting Plants of the World Online Update  ###############")
+	mesologger.info(f"############### Starting Plants of the World Online Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_powo(source)
@@ -40,7 +41,7 @@ async def update_powo(session):
     
 # Process a fresh source file
 def process_powo(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
+	mesologger.info(f"Starting to process { source['latest_download'] }...") 
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -89,7 +90,7 @@ def process_powo(source: dict):
 		# Debug: inspect raw table before cleanup
 		db.sql(f"SELECT * FROM powo").show(max_rows=100)
 		# Log
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} entries from { source['name'] } csv")
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} entries from { source['name'] } csv")
 		# Find hybrids
 		find_hybrids(db,source)  
 		# Remove ranks

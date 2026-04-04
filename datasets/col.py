@@ -24,6 +24,7 @@ source = {
 }
 
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -39,7 +40,7 @@ from ..config.schema import WGSRPDLOOKUP
 
 # Main function called as asyncio Task from run.py
 async def update_col(session):
-	print(f"IMPORT : ############### Updating Catalogue of Life ###############")
+	mesologger.info(f"############### Updating Catalogue of Life ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_col(source)
@@ -62,7 +63,7 @@ def process_col(source: dict):
 		db.execute("CREATE TEMP TABLE col_distribution AS SELECT * FROM distribution_tsv")
 		# reference.json only — read_csv chokes on the nested JSON structure
 		reference_json = db.read_json(zip.open('reference.json'),ignore_errors=True)
-		print(f"""IMPORT : {source['name']} archive unzipped""")
+		mesologger.info(f"""{source['name']} archive unzipped""")
 		db.execute(f"""
 			CREATE TABLE col AS SELECT
 				-- CoL taxon ID, ~633k rows after kingdom filter
@@ -108,17 +109,17 @@ def process_col(source: dict):
 			FROM name_tsv n
 			WHERE lower("col:kingdom") IN ('plantae','fungi')
 		""")
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants & fungi from { source['name'] }")
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants & fungi from { source['name'] }")
 		# Build compact WGSRPD name lookup table once (small dictionary -> DuckDB)
 		wgsrpd_lookup = build_wgsrpd_name_lookup()
 		db.execute("CREATE TEMP TABLE col_name_lookup(normalized_name VARCHAR, location_code VARCHAR)")
 		db.executemany("INSERT INTO col_name_lookup VALUES (?, ?)", [(name, code) for name, code in wgsrpd_lookup.items()])
 		# Build mapped text-area lookup and apply habitat enrichment using option 3
 		create_col_area_lookup(db, 'col')
-		print(f"IMPORT : Resolved {db.execute('SELECT COUNT(*) FROM col_area_lookup').fetchone()[0]:,} CoL text areas to WGSRPD/ISO fallback codes")
+		mesologger.warning(f"Resolved {db.execute('SELECT COUNT(*) FROM col_area_lookup').fetchone()[0]:,} CoL text areas to WGSRPD/ISO fallback codes")
 		apply_col_habitats(db, 'col')
-		print(f"IMPORT : Added native habitats to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE native_to IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
-		print(f"IMPORT : Added regions to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE regions IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
+		mesologger.info(f"Added native habitats to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE native_to IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
+		mesologger.info(f"Added regions to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE regions IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
 		# Enrich from reference.json: year, publication name, BHL title ID
 		db.execute(f"""
 			ALTER TABLE col ADD COLUMN publication_short VARCHAR;
@@ -132,7 +133,7 @@ def process_col(source: dict):
 				bhl_title = NULLIF(REGEXP_EXTRACT(lower(r.DOI), 'bhl\\.title\\.(\\d+)', 1),'')
 			FROM name_tsv n JOIN reference_json r ON n."col:nameReferenceID" = r.id WHERE n."col:ID" = col.id_raw;
 		""")
-		print(f"IMPORT : Added {db.execute('SELECT COUNT(publication_short) FROM ' + source['name']).fetchone()[0]:,} publications to { source['name'] }")
+		mesologger.info(f"Added {db.execute('SELECT COUNT(publication_short) FROM ' + source['name']).fetchone()[0]:,} publications to { source['name'] }")
 		# Add vernacular names from CoL VernacularName.tsv
 		col_vernacular(vernacular_tsv, db)
 		find_hybrids(db,source)
@@ -155,28 +156,28 @@ def external_col_ids(db: duckdb.DuckDBPyConnection, source: dict):
 		UPDATE col SET fungorum_id = REGEXP_EXTRACT(link_raw, '(?:https?://)?www\\.indexfungorum\\.org/Names/NamesRecord\\.asp\\?RecordID=(\\d+)', 1)
 		WHERE link_raw LIKE '%indexfungorum.org/Names/NamesRecord.asp?RecordID=%'
 	""")
-	print(f"""IMPORT : Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE fungorum_id IS NOT NULL;").fetchone()[0] } Fungorum IDs to CoL""")
+	mesologger.info(f"""Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE fungorum_id IS NOT NULL;").fetchone()[0] } Fungorum IDs to CoL""")
 	# POWO/IPNI ID from LSID URN, ~121k matched. Uses POWO IDs not IPNI as some end in -4
 	db.execute(f"""
 		ALTER TABLE {source['name']} ADD COLUMN IF NOT EXISTS powo_id VARCHAR;
 		UPDATE col SET powo_id = REGEXP_EXTRACT(link_raw, 'urn:lsid:ipni\\.org:names:(\\d+-\\d+)', 1)
 		WHERE link_raw LIKE '%urn:lsid:ipni.org:names:%'
 	""")
-	print(f"""IMPORT : Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE powo_id IS NOT NULL;").fetchone()[0] } POWO IDs to CoL""")
+	mesologger.info(f"""Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE powo_id IS NOT NULL;").fetchone()[0] } POWO IDs to CoL""")
 	# WFO ID from worldfloraonline.org URL, ~1.2k matched (very sparse)
 	db.execute(f"""
 		ALTER TABLE {source['name']} ADD COLUMN IF NOT EXISTS wfo_id VARCHAR;
 		UPDATE col SET wfo_id = REGEXP_EXTRACT(link_raw, '(?:https?://)?list\\.worldfloraonline\\.org/(wfo-\\d+)(?:-\\d{4}-\\d{2})?', 1)
 		WHERE link_raw LIKE '%worldfloraonline.org/wfo-%'
 	""")
-	print(f"""IMPORT : Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE wfo_id IS NOT NULL;").fetchone()[0] } WFO IDs to CoL""")
+	mesologger.info(f"""Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE wfo_id IS NOT NULL;").fetchone()[0] } WFO IDs to CoL""")
 	# Tropicos ID from tropicos.org URL, ~25k matched
 	db.execute(f"""
 		ALTER TABLE {source['name']} ADD COLUMN IF NOT EXISTS tropicos_id UINTEGER;
 		UPDATE col SET tropicos_id = REGEXP_EXTRACT(link_raw, 'https://www\\.tropicos\\.org/name/(\\d+)', 1)
 		WHERE link_raw LIKE '%tropicos.org/name/%'
 	""")
-	print(f"""IMPORT : Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE tropicos_id IS NOT NULL;").fetchone()[0] } Tropicos IDs to CoL""")
+	mesologger.info(f"""Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE tropicos_id IS NOT NULL;").fetchone()[0] } Tropicos IDs to CoL""")
 	# All IDs extracted, drop the raw URL column to save parquet space
 	db.execute(f"""ALTER TABLE col DROP COLUMN link_raw;""")
 
@@ -214,7 +215,7 @@ def col_vernacular(vernacular_tsv, db: duckdb.DuckDBPyConnection):
 	""")
 	# Log
 	count = db.execute("SELECT COUNT(*) FROM col WHERE vernacular IS NOT NULL AND len(vernacular) > 0").fetchone()[0]
-	print(f"IMPORT : Added vernacular names to {count:,} CoL entries")
+	mesologger.info(f"Added vernacular names to {count:,} CoL entries")
 
 
 # Build CoL text area lookup: 5 progressively aggressive normalization passes

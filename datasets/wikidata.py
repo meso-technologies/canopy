@@ -8,6 +8,7 @@
 #
 #		TODO: https://www.wikidata.org/wiki/Q312959 via https://wfoplantlist.org/taxon/wfo-4000015502-2024-12?matched_id=wfo-4000008322&page=1
 #
+from ..utils.log import mesologger
 import os
 from typing import Dict
 import duckdb
@@ -26,7 +27,7 @@ MEMORY_SAFETY_MARGIN = 0.8  # Use 80% of available memory max
 source = {
 	"name": "wikidata",
 	"url": "https://dumps.wikimedia.org/wikidatawiki/entities/latest-all.json.gz",
-	"use_aria": 8,
+	"use_aria": 3,
 	"citation": '<a href="https://wikimediafoundation.org/" class="medium">Wikimedia</a>, Individual Contributors. Wikidata: A Free Collaborative Knowledgebase. Version YYYY-MM-DD. Wikimedia Foundation, San Francisco, CA. <a href="https://www.wikidata.org/" class="medium">https://www.wikidata.org/</a>'
 }
 
@@ -56,14 +57,14 @@ RIPGREP_FILTERS = [
 
 # Main flow
 async def update_wikidata(session):
-	print(f"IMPORT : ############### Starting Wikidata Update  ###############")
+	mesologger.info(f"############### Starting Wikidata Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (settings.FORCE or update_available) and not settings.DOWNLOAD_ONLY:
 		# Ensure aria downloads are complete (resume when .aria2 exists)
 		if await aria_ready(source): process_wikidata(source)
 		# Otherwise skip processing this round
-		else: print(f"IMPORT : Skipping wikidata processing because source file is not ready")
+		else: mesologger.warning(f"Skipping wikidata processing because source file is not ready")
 	# Always return source for fuse, diff etc
 	return source
 
@@ -94,7 +95,7 @@ def process_wikidata(source: Dict):
 		# db.sql(f"""SELECT jlabels FROM wikidata_parsed""")
 		# db.sql(f"DESCRIBE wikidata_parsed").show(max_rows=200)
 		# db.sql(f"SUMMARIZE wikidata_parsed").show(max_rows=200)
-		print(f"IMPORT : Wikidata JSON parsed")
+		mesologger.info(f"Wikidata JSON parsed")
 		# Build initial table
 		db.execute(f"""
 			CREATE TABLE wikidata AS SELECT
@@ -172,7 +173,7 @@ def process_wikidata(source: Dict):
 			FROM wikidata_parsed;
 		""")
 		# Log
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants & fungi from { source['name'] }")
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} plants & fungi from { source['name'] }")
 		# Parse year_raw ISO timestamp to USMALLINT, strict validation to reject malformed dates
 		# Only ~9% populated — many Wikidata taxa lack P574 year qualifier on P225
 		db.execute(f"""
@@ -183,7 +184,7 @@ def process_wikidata(source: Dict):
 			AND SUBSTR(year_raw, 9, 2) BETWEEN '01' AND '31';
 			ALTER TABLE wikidata DROP COLUMN year_raw;
 		""")
-		print(f"IMPORT : Extracted {db.execute('SELECT COUNT(*) FROM ' + source['name']  + ' WHERE year IS NOT NULL;').fetchone()[0]:,} proper years from { source['name'] }")
+		mesologger.info(f"Extracted {db.execute('SELECT COUNT(*) FROM ' + source['name']  + ' WHERE year IS NOT NULL;').fetchone()[0]:,} proper years from { source['name'] }")
 		# Add sitelinks & pagecount - 100% have pages, 14% have wikispecies, 8% wikicommons
 		db.execute(f"""
 			ALTER TABLE wikidata ADD COLUMN IF NOT EXISTS wikipedia_pages MAP(VARCHAR, VARCHAR);
@@ -203,7 +204,7 @@ def process_wikidata(source: Dict):
 			 	wikispecies = list_any_value(map_extract(wikipedia_pages, 'species'))
 			WHERE wikipedia_pages IS NOT NULL;
 		""")
-		print("IMPORT : Added Wikipedia pages and Commons/Species links")
+		mesologger.info("Added Wikipedia pages and Commons/Species links")
 		# Map Q ranks to name and clean them
 		map_ranks(db,source)
 		build_rank_and_status(db,source)
@@ -327,7 +328,7 @@ def set_flags(db: duckdb.DuckDBPyConnection, source: dict):
 			psychoactive = list_contains(p366_list, 'Q3706669')
 		FROM p_data WHERE wikidata.id_raw = p_data.id;
 	""")
-	print(f"IMPORT : Added wikidata flags like edible, medicinal, food, perennial etc")
+	mesologger.info(f"Added wikidata flags like edible, medicinal, food, perennial etc")
 
 # Build vernacular names from 4 sources: wikipedia page titles, JSON labels, aliases, P1843 claims
 # ~208k taxa end up with vernacular, filtered to remove scientific name leakage
@@ -342,7 +343,7 @@ def wikidata_vernacular(db: duckdb.DuckDBPyConnection, source: dict):
 		WHERE x.key NOT IN ('commons', 'species', 'wikidata', 'mediawiki', 'simple') AND LOWER(x.value) NOT IN (LOWER(w.name_raw), w.name_clean);
 	""")
 	inital_count = db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0]
-	print(f"IMPORT : Copied {inital_count:,} names from wikipedia page titles")
+	mesologger.info(f"Copied {inital_count:,} names from wikipedia page titles")
 	# Source 2: Wikidata JSON labels (one per language per entity), skip scientific name matches
 	db.execute("""
 		WITH unnested AS (SELECT id, UNNEST(map_values(jlabels)) AS entry FROM wikidata_parsed)
@@ -353,7 +354,7 @@ def wikidata_vernacular(db: duckdb.DuckDBPyConnection, source: dict):
 		);
 	""")
 	label_count = db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0] - inital_count
-	print(f"IMPORT : Added {label_count:,} names from jlabels")
+	mesologger.info(f"Added {label_count:,} names from jlabels")
 	# Source 3: Wikidata JSON aliases (multiple per language), split on comma/semicolon
 	db.execute("""
 		WITH flattened AS (
@@ -367,10 +368,10 @@ def wikidata_vernacular(db: duckdb.DuckDBPyConnection, source: dict):
 		);
 	""")
 	alias_count = db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0] - inital_count - label_count
-	print(f"IMPORT : Added {alias_count:,} names from jaliases")
+	mesologger.info(f"Added {alias_count:,} names from jaliases")
 	# Source 4: P1843 common name claims - structured multilingual names with language tags
 	db.execute("""CREATE TEMPORARY TABLE P1843_data AS SELECT wp.id, UNNEST(wp.jclaims.P1843) AS claim FROM wikidata_parsed wp WHERE wp.jclaims.P1843 IS NOT NULL""")
-	print('IMPORT : Unnested P1843 claims')
+	mesologger.info('Unnested P1843 claims')
 	# Split comma/semicolon-separated names, skip undetermined (und) and miscellaneous (mis) languages
 	db.execute("""
 		WITH extracted AS (
@@ -382,7 +383,7 @@ def wikidata_vernacular(db: duckdb.DuckDBPyConnection, source: dict):
 	""")
 	highest_count = db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0]
 	p_count = highest_count - inital_count - label_count - alias_count
-	print(f"IMPORT : Added {p_count:,} vernacular names from P1843 claims")
+	mesologger.info(f"Added {p_count:,} vernacular names from P1843 claims")
 	# db.sql('SELECT COUNT(*) FROM vernacular').show(max_rows=80)
 	# db.sql(f"SELECT * FROM vernacular WHERE id = 'Q27734'").show(max_rows=80)
 	# Remove scientific name leakage, infrarank markers, hybrid names, and empty strings
@@ -399,14 +400,14 @@ def wikidata_vernacular(db: duckdb.DuckDBPyConnection, source: dict):
 			OR REGEXP_MATCHES(lower(v.common_name), '(category:|subgen\\.|[ ]subgen[ ]|ssp\\.|[ ]ssp[ ]|subg\\.|[ ]subg[ ]|var\\.|[ ]var[ ]|subsp\\.|[ ]subsp[ ]|fo\\.|f\\.|sp\\. nov\\.)')
 			OR CONTAINS(v.common_name, '×') OR trim(v.common_name) = '';
 	""")
-	print(f"IMPORT : Deleted {(highest_count - db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0]):,} unwanted vernacular names")
+	mesologger.info(f"Deleted {(highest_count - db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0]):,} unwanted vernacular names")
 	# Normalize 3-letter ISO 639-2 language codes to 2-letter ISO 639-1
 	db.execute(f"""CREATE TEMPORARY TABLE IF NOT EXISTS language_map AS SELECT * FROM (VALUES {language_mappings}) AS t(iso639_2, iso639_1);""")
 	db.execute(f"""
 		UPDATE vernacular SET language = COALESCE((SELECT iso639_1 FROM language_map WHERE iso639_2 = vernacular.language), language)
 		WHERE language IN (SELECT iso639_2 FROM language_map);
 	""")
-	print(f"IMPORT : Normalized language in vernacular names")
+	mesologger.info(f"Normalized language in vernacular names")
 	# db.sql(f"SELECT DISTINCT common_name, COUNT(common_name) FROM vernacular GROUP BY common_name ORDER BY COUNT(common_name) DESC").show(max_rows=200)
 	# Aggregate cleaned vernacular into MAP(lang -> names[]) on main table
 	db.execute(f"""
@@ -416,7 +417,7 @@ def wikidata_vernacular(db: duckdb.DuckDBPyConnection, source: dict):
 			FROM (SELECT v.language, ARRAY_AGG(v.common_name) AS names FROM vernacular v WHERE v.id = w.id_raw GROUP BY v.language)
 		);
 	""")
-	print(f"IMPORT : Added {db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0]:,} vernacular names to wikidata table")
+	mesologger.info(f"Added {db.execute('SELECT COUNT(*) FROM vernacular').fetchone()[0]:,} vernacular names to wikidata table")
 	# Debug: check for anomalies in vernacular data
 	if settings.VERBOSE:
 		# Suspiciously long names that might be descriptions or sentences

@@ -21,6 +21,7 @@
 #		TODO: Extract full lifeform_description and climate_description beyond boolean flags
 #
 # Internal
+from ..utils.log import mesologger
 from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
@@ -40,7 +41,7 @@ source = {
 
 # Main function called as asyncio Task from run.py
 async def update_wcvp(session):
-	print(f"IMPORT : ############### Starting World Checklist of Vascular Plants Update  ###############")
+	mesologger.info(f"############### Starting World Checklist of Vascular Plants Update  ###############")
 	update_available = await fetch(session, source)
 	# See if we have an update and if yes process it
 	if (update_available or settings.FORCE) and not settings.DOWNLOAD_ONLY: process_wcvp(source)
@@ -49,7 +50,7 @@ async def update_wcvp(session):
     
 # Process a fresh source file
 def process_wcvp(source: dict):
-	print(f"IMPORT : Starting to process { source['latest_download'] }...") 
+	mesologger.info(f"Starting to process { source['latest_download'] }...") 
 	# Resolve local source path (already ensured by fetch in S3 mode)
 	source_path = source.get('local_path') or f"{SRC_DIR}/{source['latest_download']}"
 	# Load zipfile and duckdb
@@ -100,7 +101,7 @@ def process_wcvp(source: dict):
 			FROM name_csv 
 		""")
 		# Log
-		print(f"IMPORT : Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} entries from { source['name'] } csv")
+		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} entries from { source['name'] } csv")
 		# Add locations
 		db.execute(""" 
 			ALTER TABLE wcvp ADD COLUMN IF NOT EXISTS native_to VARCHAR[];
@@ -109,7 +110,7 @@ def process_wcvp(source: dict):
 			 	FROM distribution_csv WHERE introduced = 0 GROUP BY plant_name_id )
 			UPDATE wcvp SET native_to = h.locations FROM habitats h WHERE wcvp.id_raw = h.plant_name_id;
 		""") 
-		print(f"IMPORT : Added native habitats to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE native_to IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
+		mesologger.info(f"Added native habitats to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE native_to IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
 		# Add locations
 		db.execute(""" 
 			ALTER TABLE wcvp ADD COLUMN IF NOT EXISTS regions VARCHAR[];
@@ -118,7 +119,7 @@ def process_wcvp(source: dict):
 			 	FROM distribution_csv GROUP BY plant_name_id )
 			UPDATE wcvp SET regions = h.locations FROM habitats h WHERE wcvp.id_raw = h.plant_name_id;
 		""") 
-		print(f"IMPORT : Added regions to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE regions IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
+		mesologger.info(f"Added regions to {db.execute('SELECT COUNT(*) FROM ' + source['name'] + ' WHERE regions IS NOT NULL;').fetchone()[0]:,} { source['name'] } rows")
 		# Remove ranks
 		strip_rank_from_name(db,source)  
 		# Find hybrids

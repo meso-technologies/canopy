@@ -3,6 +3,7 @@
 #			Generally should be called in the order they listed here, ie do name cleanup after having found hybrids and removed ranks/authors
 #
 
+from .log import mesologger
 import os
 import duckdb
 from .. import settings, PROCESSED_DIR
@@ -21,7 +22,7 @@ publication_filter = "'^(.*?)(?:\\s+\\d+(?:\\s*\\([^)]*\\))?(?:\\s*:|$))'"
 def find_hybrids(db: duckdb.DuckDBPyConnection, source: dict):
 	# Usual x / × misspelling
 	rows = db.execute(f"UPDATE {source['name']} SET name_clean = replace(name_clean, ' x ', ' × ') WHERE name_clean LIKE '% x %' RETURNING 1").fetchdf()
-	if len(rows) > 0: print(f"IMPORT : Changed {len(rows):,} ' x ' to ' × ' in {source['name']}")
+	if len(rows) > 0: mesologger.info(f"Changed {len(rows):,} ' x ' to ' × ' in {source['name']}")
 	# Always add column
 	db.execute(f"""ALTER TABLE {source['name']} ADD COLUMN IF NOT EXISTS hybrid BOOLEAN;""")
 	# Check for x symbols first
@@ -35,16 +36,16 @@ def find_hybrids(db: duckdb.DuckDBPyConnection, source: dict):
 			WHERE COALESCE(hybrid, FALSE) = FALSE;
 		""")
 	count = db.execute(f"SELECT count(*) FROM {source['name']} WHERE hybrid").fetchone()[0]
-	if count > 0: print(f"IMPORT : Found {count:,} hybrids in {source['name']}")
+	if count > 0: mesologger.info(f"Found {count:,} hybrids in {source['name']}")
 	# Note position of ×
 	db.execute(f"""
 		ALTER TABLE {source['name']} ADD COLUMN IF NOT EXISTS hybridpos UTINYINT;
 		UPDATE {source['name']} SET hybridpos = NULLIF(position('×' in name_clean) - 1, -1) WHERE hybrid;
 	""")	
-	print(F"IMPORT : Noted hybrid sign positions")
+	mesologger.info(F"Noted hybrid sign positions")
 	# Remove × from name
 	db.execute(f"UPDATE {source['name']} SET name_clean = replace(replace(name_clean,'× ',''),'×','')")	  
-	print(F"IMPORT : Removed hybrid sign from names")
+	mesologger.info(F"Removed hybrid sign from names")
 
 # Lot of datasets have the author in the scientificName and separate, thus we remove it from name_clean
 def strip_author_from_name(db: duckdb.DuckDBPyConnection, source: dict):
@@ -54,7 +55,7 @@ def strip_author_from_name(db: duckdb.DuckDBPyConnection, source: dict):
 		WHERE LOWER(name_clean) LIKE '%' || LOWER(TRIM(author_raw)) || '%'
 		RETURNING 1
 	""").fetchdf()
-	if len(rows) > 0: print(f"IMPORT : Removed {len(rows):,} authors from name_clean in {source['name']}")
+	if len(rows) > 0: mesologger.info(f"Removed {len(rows):,} authors from name_clean in {source['name']}")
 
 # Remove rank terms from name_clean to avoid duplication with rank field
 def strip_rank_from_name(db: duckdb.DuckDBPyConnection, source: dict):
@@ -64,7 +65,7 @@ def strip_rank_from_name(db: duckdb.DuckDBPyConnection, source: dict):
 		WHERE LOWER(name_clean) LIKE '%' || LOWER(TRIM(rank_raw)) || '%'
 		RETURNING 1
 		""").fetchdf()
-	if len(rows) > 0: print(f"IMPORT : Removed {len(rows):,} rank terms from name_clean in {source['name']}")
+	if len(rows) > 0: mesologger.info(f"Removed {len(rows):,} rank terms from name_clean in {source['name']}")
 
 # Generic cleanup of misspellings etc in names
 def name_cleanup(db: duckdb.DuckDBPyConnection, source: dict):
@@ -75,17 +76,17 @@ def name_cleanup(db: duckdb.DuckDBPyConnection, source: dict):
     		WHERE regexp_matches(name_clean, ' (notho)?(ser|sect|subsect|subgen|sub|bb|ab|mut|var|subvar|convar|race|subsp|subspec|ssp|forma|form|subf|f|fo|fma|unr|lus|lusus|prol|proles|sp nov|sp\\. nov|f\\.sp\\.|\\[unranked\\])(\\.?)(\\s|$)')
 		RETURNING 1;
 	""").fetchdf()
-	if len(rows) > 0: print(f"IMPORT : Removed {len(rows):,} rank leftovers from {source['name']}")
+	if len(rows) > 0: mesologger.info(f"Removed {len(rows):,} rank leftovers from {source['name']}")
 	# Replace all quote characters quotes with single quotes (U+0027 : APOSTROPHE {single quote; APL quote})
 	quote_char_pattern = """["ʽ‛‟′″‴’‘]"""
 	rows = db.execute(f"""UPDATE {source['name']} SET name_clean = regexp_replace(name_clean, '{quote_char_pattern}', '''', 'g') WHERE regexp_matches(name_clean, '{quote_char_pattern}') RETURNING 1;""").fetchdf()
-	if len(rows) > 0: print(f"IMPORT : Replaced {len(rows):,} quote characters with single quotes in {source['name']}")
+	if len(rows) > 0: mesologger.info(f"Replaced {len(rows):,} quote characters with single quotes in {source['name']}")
 	# Check for and remove stray characters in name_clean (keeping spaces, quotes, simple dashes)
 	stray_regex_pattern = """[^a-z -'']"""
 	stray_chars = db.execute(f"""SELECT COUNT(*) FROM {source['name']} WHERE regexp_matches(name_clean, '{stray_regex_pattern}');""").fetchone()[0]
 	if stray_chars > 0:
 		db.execute(f"""UPDATE {source['name']} SET name_clean = regexp_replace(name_clean, '{stray_regex_pattern}', '', 'g') WHERE regexp_matches(name_clean, '{stray_regex_pattern}');""")
-		print(f"IMPORT : Cleaned characters that are not standard lowercase latin from {stray_chars:,} rows in {source['name']}")
+		mesologger.info(f"Cleaned characters that are not standard lowercase latin from {stray_chars:,} rows in {source['name']}")
 	# Check and clean multiple spaces, leading/trailing spaces
 	rows = db.execute(f"""
 		UPDATE {source['name']} SET name_clean = trim(
@@ -96,11 +97,11 @@ def name_cleanup(db: duckdb.DuckDBPyConnection, source: dict):
 		WHERE regexp_matches(name_clean, ' {{2,}}|\t|^ | $')     	-- find entries with 2+ spaces, tabs, leading or trailing spaces
 		RETURNING 1;
 	""").fetchdf()
-	if len(rows) > 0: print(f"IMPORT : Cleaned {len(rows):,} entries with multiple/leading/trailing spaces in {source['name']}")
+	if len(rows) > 0: mesologger.info(f"Cleaned {len(rows):,} entries with multiple/leading/trailing spaces in {source['name']}")
 	delete_count = db.execute(f"""SELECT COUNT(*) FROM {source['name']} WHERE name_clean = '';""").fetchone()[0]
 	if delete_count > 0: 
 		db.execute(f"DELETE FROM {source['name']} WHERE name_clean = '';")
-		print(f"IMPORT : Deleted {delete_count:,} entries with empty {source['name']} name")
+		mesologger.info(f"Deleted {delete_count:,} entries with empty {source['name']} name")
 
 # Normalize taxon ranks and optional status flags into canonical canopy values
 # Rank normalization follows ICN rank hierarchy and includes practical source-specific aliases.
@@ -198,7 +199,7 @@ def build_rank_and_status(db: duckdb.DuckDBPyConnection, source: dict):
 			UPDATE {source['name']} SET synonym = (status_clean = 'synonym'), accepted = (status_clean = 'accepted')
 		""")
 		count = db.execute(f"""SELECT sum(accepted), sum(synonym), COUNT(*) FILTER (WHERE status_clean = 'problematic'), COUNT(*) FILTER (WHERE status_clean = 'edgecase') FROM {source['name']}""").fetchone()
-		if count: print(f"IMPORT : {int(count[0] or 0):,} accepted, {int(count[1] or 0):,} synonymic, {int(count[2] or 0):,} problematic taxons in {source['name']}, with {int(count[3] or 0):,} edge-cases")
+		if count: mesologger.info(f"{int(count[0] or 0):,} accepted, {int(count[1] or 0):,} synonymic, {int(count[2] or 0):,} problematic taxons in {source['name']}, with {int(count[3] or 0):,} edge-cases")
 		if settings.VERBOSE: db.sql(f"SELECT DISTINCT status_clean, list_distinct(list(status_raw)), COUNT(status_clean) FROM {source['name']} GROUP BY status_clean ORDER BY COUNT(status_clean) DESC").show(max_rows=75)	
 
 # See if we have any issues left
@@ -224,13 +225,13 @@ def validate(db: duckdb.DuckDBPyConnection, source: dict):
 	result = db.sql(f"""SELECT {columns} FROM {source['name']} WHERE array_length(regexp_split_to_array(trim(name_clean), '\\s+')) > 3 {" AND rank_clean != 'cultivar'" if ranks else ''};""")
 	rows = result.fetchdf()
 	if len(rows) > 0:
-		print(f"IMPORT : {source['name']} still has {len(rows):,} non-trinomial rows (more than 3 words in name_clean):")
+		mesologger.warning(f"{source['name']} still has {len(rows):,} non-trinomial rows (more than 3 words in name_clean):")
 		result.show(max_rows=200)
 	# Check for non-alphabetic characters in name_clean
 	result = db.sql(f"SELECT {columns} FROM {source['name']} WHERE name_clean ~ '[^a-z -'']';")
 	rows = result.fetchdf()
 	if len(rows) > 0:
-		print(f"IMPORT : {source['name']} has {len(rows):,} rows with non-alphabetic characters in name_clean:")
+		mesologger.info(f"{source['name']} has {len(rows):,} rows with non-alphabetic characters in name_clean:")
 		result.show(max_rows=200)
 	# General overview
 	if settings.VERBOSE: 
@@ -251,11 +252,11 @@ def write_to_disc(db: duckdb.DuckDBPyConnection, source: dict, dir = PROCESSED_D
 	if storage.is_s3(): storage.configure_duckdb(db)
 	# Write parquet via COPY for consistent local and S3 support
 	db.execute(f"COPY {source['name']} TO '{output_path}' (FORMAT PARQUET)")
-	print(f"IMPORT : Wrote {rows:,} rows to parquet file {output_path}")
+	mesologger.info(f"Wrote {rows:,} rows to parquet file {output_path}")
 	# Write .csv as well if we have our flag set
 	if settings.CSV: 
 		db.sql(f"SELECT * FROM {source['name']}").write_csv(f"{ dir }/{ filename }.tsv",sep='\t') 
-		print(f"IMPORT : Wrote {rows:,} rows to tsv file { dir }/{ filename }.tsv")
+		mesologger.info(f"Wrote {rows:,} rows to tsv file { dir }/{ filename }.tsv")
 	# If it's not a release candidate
 	if source['name'] != 'meso':
 		# Update latest processed once we wrote it to disc
