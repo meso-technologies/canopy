@@ -1,5 +1,6 @@
 # Keep these folder names visible from one central gitignore
 !source/
+!state/
 !temp/
 !processed/
 !releases/
@@ -8,6 +9,7 @@
 
 # Ignore all runtime data contents
 source/**
+state/**
 temp/**
 processed/**
 releases/**

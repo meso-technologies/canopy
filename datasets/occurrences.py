@@ -348,6 +348,8 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 	# Logging
 	counter = 1
 	total = len(zip.filelist)
+	# Track extracted occurrence count for progress and final summary
+	occurrence_count = 0
 	# Iterate through all files
 	for file in zip.filelist:
 		# Ignore empty files
@@ -379,8 +381,12 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 		print(f"\rIMPORT : Extracted {occurrence_count:,} occurrences from {counter} of {total} files",end="")
 		# Iterate 
 		counter += 1
-	# Log	
-	print(f"\nIMPORT : Successfully extracted {occurrence_count:,} occurrences from {total} files")
+	# Refresh final extracted count for accurate end-of-stage logging
+	occurrence_count = db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
+	# Print final extraction summary on the same carriage-return line as progress output
+	print(f"\rIMPORT : Successfully extracted {occurrence_count:,} occurrences from {total} files".ljust(96), end="")
+	# Finish progress line with newline
+	print()
 
 # Apply incremental GBIF download: merge new/updated occurrences into existing parquet
 def process_incremental_update(manifest,filename):

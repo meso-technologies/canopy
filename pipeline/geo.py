@@ -76,7 +76,10 @@ HABITAT_BATCH_TAXA = 20000
 # Keep elevation profile granularity at 100m bins
 ELEVATION_BIN_SIZE = 100
 # Keep legacy-style raw fallback cutoff based on habitat tile cardinality
+# Below this threshold we cluster raw occurrences; at and above it we cluster weighted habitat tiles
 HABITAT_TILE_THRESHOLD = 100
+# Cap packaged habitat tile count per taxon for frontend map performance via adaptive coarsening
+HABITAT_DISPLAY_CAP = 20000
 # Split packaging into deterministic hash partitions to cap peak memory during habitat aggregation
 PACKAGE_PARTITIONS = 16
 
@@ -871,55 +874,28 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 			# Build one partition of geo payload with the same variant-A semantics
 			db.execute(f"""
 				COPY (
-					WITH habitat_part AS (
-						SELECT
-							gbif_id,
-							-- Sort dense tiles first so sparse ones don't obscure them on map render, 20 chosen as visual sweet spot across species with varying tile counts
-							array_agg(
-								struct_pack(lng := center_lng, lat := center_lat, occ := count)
-								ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC
-							)::JSON AS habitat,
-							max(count) AS max,
-							avg(count) AS avg
-						FROM read_parquet('{habitat_path_sql}')
-						WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}
-						GROUP BY gbif_id
-					),
-					centroid_clean AS (
-						SELECT
-							gbif_id,
-							list_distinct(
-								list_transform(
-									centroids,
-									coord -> [coord[1]::DECIMAL(8,4), coord[2]::DECIMAL(8,4)]
-								)
-							)::JSON AS centroids
-						FROM read_parquet('{centroids_path_sql}')
-						WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}
-					),
-					elevation_profile_clean AS (
-						SELECT
-							gbif_id,
-							array_agg(struct_pack(elevation := elevation_bin, occ := bin_count) ORDER BY elevation_bin)::JSON AS elevation_profile
-						FROM read_parquet('{elevation_bins_path_sql}')
-						WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}
-						GROUP BY gbif_id
-					),
-					elevation_medians_clean AS (
-						SELECT
-							gbif_id,
-							cast(elevation AS SMALLINT) AS elevation
-						FROM read_parquet('{elevation_medians_path_sql}')
-						WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}
-					)
-					SELECT
-						h.gbif_id,
-						h.habitat,
-						h.max,
-						h.avg,
-						c.centroids,
-						m.elevation,
-						ep.elevation_profile
+					-- Load this hash partition of habitat rows from staged parquet.
+					WITH habitat_raw AS (SELECT gbif_id, tile_id, center_lng, center_lat, count FROM read_parquet('{habitat_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}),
+					-- Count tile cardinality per taxon to identify heavy maps.
+					habitat_counts AS (SELECT gbif_id, COUNT(*) AS tile_count FROM habitat_raw GROUP BY gbif_id),
+					-- Compute adaptive coarsening shift for taxa above display cap.
+					habitat_cfg AS (SELECT gbif_id, CAST(greatest(1, ceil(ln(tile_count::DOUBLE / {HABITAT_DISPLAY_CAP}::DOUBLE) / ln(4.0))) AS INTEGER) AS shift FROM habitat_counts WHERE tile_count > {HABITAT_DISPLAY_CAP}),
+					-- Keep non-heavy taxa unchanged at native tile resolution.
+					habitat_non_heavy AS (SELECT h.gbif_id, h.tile_id, h.center_lng, h.center_lat, h.count FROM habitat_raw h LEFT JOIN habitat_cfg c ON h.gbif_id = c.gbif_id WHERE c.gbif_id IS NULL),
+					-- Coarsen heavy taxa and preserve weighted centers plus occurrence mass.
+					habitat_heavy_coarse AS (SELECT h.gbif_id, CAST(floor(floor(h.tile_id / {TILE_COUNT}) / pow(2, c.shift)) * {TILE_COUNT} + floor((h.tile_id % {TILE_COUNT}) / pow(2, c.shift)) AS UINTEGER) AS tile_id, sum(h.center_lng * h.count) / sum(h.count) AS center_lng, sum(h.center_lat * h.count) / sum(h.count) AS center_lat, sum(h.count) AS count FROM habitat_raw h JOIN habitat_cfg c ON h.gbif_id = c.gbif_id GROUP BY 1,2),
+					-- Recombine unchanged and coarsened rows before JSON packing.
+					habitat_normalized AS (SELECT * FROM habitat_non_heavy UNION ALL SELECT * FROM habitat_heavy_coarse),
+					-- Pack habitat JSON with dense-first ordering for map rendering.
+					habitat_part AS (SELECT gbif_id, array_agg(struct_pack(lng := center_lng, lat := center_lat, occ := count) ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC)::JSON AS habitat, max(count) AS max, avg(count) AS avg FROM habitat_normalized GROUP BY gbif_id),
+					-- Normalize and dedupe centroid pairs to legacy DECIMAL precision per partition.
+					centroid_clean AS (SELECT gbif_id, list_distinct(list_transform(centroids, coord -> [coord[1]::DECIMAL(8,4), coord[2]::DECIMAL(8,4)]))::JSON AS centroids FROM read_parquet('{centroids_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}),
+					-- Pack elevation profile bins into stable elevation-sorted JSON arrays.
+					elevation_profile_clean AS (SELECT gbif_id, array_agg(struct_pack(elevation := elevation_bin, occ := bin_count) ORDER BY elevation_bin)::JSON AS elevation_profile FROM read_parquet('{elevation_bins_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part} GROUP BY gbif_id),
+					-- Cast elevation medians into final storage type for this partition.
+					elevation_medians_clean AS (SELECT gbif_id, cast(elevation AS SMALLINT) AS elevation FROM read_parquet('{elevation_medians_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part})
+					-- Join packaged habitat rows with normalized centroids and elevation payloads.
+					SELECT h.gbif_id, h.habitat, h.max, h.avg, c.centroids, m.elevation, ep.elevation_profile
 					FROM habitat_part h
 					LEFT JOIN centroid_clean c ON h.gbif_id = c.gbif_id
 					LEFT JOIN elevation_profile_clean ep ON h.gbif_id = ep.gbif_id
