@@ -92,6 +92,22 @@ class LocalStorage:
 		# Copy file preserving metadata
 		shutil.copy2(src, dst)
 
+	# Write raw bytes payload to storage path
+	def write_bytes(self, path, data, content_type='application/octet-stream'):
+		# Ensure destination directory exists before writing bytes
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		# Write payload bytes to local filesystem
+		with open(path, 'wb') as file: file.write(data)
+
+	# Copy one local file into storage path
+	def put_file(self, path, local_path):
+		# Load shutil lazily to keep module imports minimal
+		import shutil
+		# Ensure destination directory exists before copy
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		# Copy local file into destination path
+		shutil.copy2(local_path, path)
+
 	# Remove local directory tree recursively
 	def rmtree(self, path):
 		# Load shutil lazily to keep module imports minimal
@@ -342,6 +358,20 @@ class S3Storage:
 		payload = json.dumps(data, indent=4).encode('utf-8')
 		# Upload JSON payload to S3
 		self.s3.put_object(Bucket=self.bucket, Key=key, Body=payload, ContentType='application/json')
+
+	# Write raw bytes payload to S3 object key
+	def write_bytes(self, path, data, content_type='application/octet-stream'):
+		# Resolve object key from path-like input
+		key = self._resolve_key(path)
+		# Upload raw bytes payload to S3 object storage
+		self.s3.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
+
+	# Copy one local file into a storage path key
+	def put_file(self, path, local_path):
+		# Resolve object key from path-like input
+		key = self._resolve_key(path)
+		# Upload local file into resolved object key
+		self.s3.upload_file(local_path, self.bucket, key)
 
 	# Directory creation is a no-op on object storage
 	def makedirs(self, path):
