@@ -12,8 +12,9 @@ from ..utils.log import mesologger
 import os, io, aiohttp, json, asyncio
 from datetime import datetime, timezone, timedelta
 # Internal
-from .. import TMP_DIR, GEO_DIR, settings
+from .. import TMP_DIR, GEO_DIR, PROCESSED_DIR, settings
 from ..utils.downloader import aria_download
+from ..utils.filehandlers import get_file
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
 # File handling & DB
@@ -338,13 +339,21 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 	return bool(success)
 
 # Shared extraction: iterate parquet chunks in GBIF zip, filter plantae/fungi with valid coords
-# Produces temp occurrences table with (id, taxon, location, elevation, spatial_issue)
+# Produces temp occurrences table with canonical taxon plus raw GBIF taxon key for synonym auditing
 def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 	# Load spatial and spawn DB outside of file loop
 	db.execute("""
 		INSTALL spatial;
 		LOAD spatial;
-		CREATE TEMP TABLE occurrences (id UBIGINT, taxon UINTEGER, location GEOMETRY, elevation SMALLINT, spatial_issue BOOLEAN DEFAULT FALSE);
+		CREATE TEMP TABLE occurrences (
+			id UBIGINT,
+			taxon UINTEGER,
+			taxon_raw UINTEGER,
+			synonym_for UINTEGER,
+			location GEOMETRY,
+			elevation SMALLINT,
+			spatial_issue BOOLEAN DEFAULT FALSE
+		);
 	""")
 	# Logging
 	counter = 1
@@ -363,9 +372,12 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 			SELECT 
 				-- Unique occurrence ID
 				gbifid AS id,
-				-- We use speciesKey first, as it maps eg synonym occurrences to the correct accepted species
-				-- but also fall back on taxonKey, for example if the occurrence is for a genus or family
-				COALESCE(speciesKey,taxonkey) AS taxon,
+				-- Keep raw GBIF interpreted taxon key for deterministic post-extract synonym mapping
+				CAST(taxonkey AS UINTEGER) AS taxon_raw,
+				-- Seed canonical taxon from raw key, then overwrite only synonym rows
+				CAST(taxonkey AS UINTEGER) AS taxon,
+				-- Fill synonym target key after extraction when raw key is a synonym
+				CAST(NULL AS UINTEGER) AS synonym_for,
 				-- 3 digits gives us about ~71m lon and ~111 meters lat, which is more than enough for 1-10km grids
 				-- and 30 arcsecond (~594 meters lon x  ~926 meters lat) lookups
 				ST_Point(ROUND(decimallongitude, 3),ROUND(decimallatitude, 3)) AS location,
@@ -386,13 +398,72 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 	occurrence_count = db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
 	# Print final extraction summary on the same carriage-return line as progress output
 	mesologger.info(f"Successfully extracted {occurrence_count:,} occurrences from {total} files".ljust(96), extra={'sameline': True})
+	# Resolve synonyms to accepted GBIF keys once during ingest so geo stage can stay simple
+	resolve_occurrence_taxonkeys(db)
 	# Finish progress line with newline
 	
+
+# Resolve canonical GBIF occurrence taxon keys using processed GBIF acceptedNameUsage mapping
+# Synonym rows get mapped to acceptedNameUsageID, non-synonyms keep their raw key
+# This keeps geo stage lightweight and avoids heavy synonym joins during habitat processing
+def resolve_occurrence_taxonkeys(db: duckdb.DuckDBPyConnection):
+	# Resolve latest processed GBIF backbone parquet used for synonym mapping
+	gbif_file = get_file('gbif', PROCESSED_DIR)
+	# Fall back to raw keys when GBIF backbone is unavailable
+	if not gbif_file:
+		mesologger.warning('No processed GBIF parquet found, using raw occurrence taxon keys')
+		db.execute("UPDATE occurrences SET taxon = taxon_raw")
+		return
+	# Build GBIF parquet path and URL for DuckDB reads (local path or s3 URL)
+	gbif_path = os.path.join(PROCESSED_DIR, gbif_file)
+	gbif_url = storage.parquet_url(gbif_path)
+	# Configure DuckDB S3 settings when reading GBIF parquet from object storage
+	if storage.is_s3(): storage.configure_duckdb(db)
+	# Materialize compact synonym mapping table from processed GBIF backbone
+	# Fall back gracefully when older processed gbif parquets do not yet include accepted_raw
+	try:
+		db.execute(f"""
+			CREATE TEMP TABLE gbif_synonym_map AS
+			SELECT
+				CAST(id_raw AS UINTEGER) AS synonym_key,
+				MIN(CAST(accepted_raw AS UINTEGER)) AS accepted_key
+			FROM read_parquet('{gbif_url}')
+			WHERE status_clean = 'synonym' AND accepted_raw IS NOT NULL
+			GROUP BY 1;
+		""")
+		# Update synonym rows with scalar-subquery mapping (winner in ABTEST11)
+		db.execute("""
+			UPDATE occurrences
+			SET
+				synonym_for = (
+					SELECT m.accepted_key
+					FROM gbif_synonym_map m
+					WHERE m.synonym_key = occurrences.taxon_raw
+				),
+				taxon = COALESCE((
+					SELECT m.accepted_key
+					FROM gbif_synonym_map m
+					WHERE m.synonym_key = occurrences.taxon_raw
+				), taxon_raw)
+			WHERE taxon_raw IN (SELECT synonym_key FROM gbif_synonym_map);
+		""")
+		# Optionally collect mapped row count in verbose mode only to avoid an extra full scan
+		if settings.VERBOSE:
+			mapped_count = db.execute("SELECT COUNT(*) FROM occurrences WHERE synonym_for IS NOT NULL").fetchone()[0]
+			mesologger.info(f"Mapped {mapped_count:,} occurrence rows to accepted GBIF synonym targets")
+		# Otherwise keep log lightweight for large daily runs
+		else: mesologger.info("Mapped synonym occurrence keys to accepted GBIF targets")
+	except Exception as error:
+		# Preserve raw key behavior when synonym mapping columns are unavailable
+		mesologger.warning(f"GBIF synonym mapping unavailable, using raw occurrence taxon keys {type(error).__name__}: {error}")
+		db.execute("UPDATE occurrences SET taxon = taxon_raw")
 
 # Apply incremental GBIF download: merge new/updated occurrences into existing parquet
 def process_incremental_update(manifest,filename):
 	# Spawn zipfile and DuckDB
 	with zipfile.ZipFile(os.path.join(TMP_DIR, filename), 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory before heavy joins/updates
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Use shared function to get updates
 		extract_from_zip(zip,db)
 		# Check if we even have any new occurrences
@@ -401,7 +472,6 @@ def process_incremental_update(manifest,filename):
 			mesologger.info(f"No new occurrences in incremental update")		
 		# Otherwise process them	
 		else:
-			db.execute(f"SET temp_directory = '{ TMP_DIR }'")
 			# Load existing geoparquet into DuckDB for merge
 			# Ensure rolling occurrence parquet is available locally for DuckDB read
 			existing_path = storage.ensure_local(os.path.join(GEO_DIR,'occurrences.parquet'), GEO_DIR)
@@ -410,7 +480,13 @@ def process_incremental_update(manifest,filename):
 				INSTALL spatial;
 				LOAD spatial;
 				CREATE TABLE existing_occurrences AS SELECT * FROM existing_occurrence_parquet;
-			""")	
+			""")
+			# Keep incremental merge compatible with old rolling files that predate synonym-mapped key columns
+			db.execute("""
+				ALTER TABLE existing_occurrences ADD COLUMN IF NOT EXISTS taxon UINTEGER;
+				ALTER TABLE existing_occurrences ADD COLUMN IF NOT EXISTS taxon_raw UINTEGER;
+				ALTER TABLE existing_occurrences ADD COLUMN IF NOT EXISTS synonym_for UINTEGER;
+			""")
 			count = db.execute("SELECT COUNT(*) FROM existing_occurrences").fetchone()[0]
 			mesologger.info(f"Loaded {count:,} occurrences from existing {os.path.join(GEO_DIR,'occurrences.parquet')}")
 			# Count incoming rows that match existing occurrence ids
@@ -424,15 +500,20 @@ def process_incremental_update(manifest,filename):
 			# Upsert: update changed occurrences, then insert new ones
 			db.execute("""
 				UPDATE existing_occurrences
-				SET taxon = occurrences.taxon, location = occurrences.location,
-					elevation = occurrences.elevation, spatial_issue = occurrences.spatial_issue
+				SET taxon = occurrences.taxon,
+					taxon_raw = occurrences.taxon_raw,
+					synonym_for = occurrences.synonym_for,
+					location = occurrences.location,
+					elevation = occurrences.elevation,
+					spatial_issue = occurrences.spatial_issue
 				FROM occurrences WHERE existing_occurrences.id = occurrences.id;
 			""")
 			# Log how many incoming occurrences mapped to existing ids
 			mesologger.info(f"Updated {updated_count:,} existing occurrences")
 			# Insert occurrences not already in existing set
 			db.execute("""
-				INSERT INTO existing_occurrences SELECT * FROM occurrences AS source
+				INSERT INTO existing_occurrences BY NAME
+				SELECT * FROM occurrences AS source
 				WHERE NOT EXISTS (SELECT 1 FROM existing_occurrences AS target WHERE target.id = source.id);
 			""")
 			mesologger.info(f"Added {db.execute("SELECT COUNT(*) FROM existing_occurrences").fetchone()[0]-count:,} new occurrences")
@@ -453,6 +534,8 @@ def distill_occurrences():
 	mesologger.info(f"############### Processing GBIF occurrences ###############")
 	# Pointer to zip and spawn db
 	with zipfile.ZipFile(os.path.join(TMP_DIR, f"occurrences.zip"), 'r') as zip, duckdb.connect(':memory:') as db:
+		# Route DuckDB spill files to canopy temp directory before heavy extract/mapping writes
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Use shared function
 		extract_from_zip(zip,db)
 		# Write to disc using COPY as write_parquet() doesn't do geoparquet well

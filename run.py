@@ -43,6 +43,8 @@ async def main(argv=None):
 	parser.add_argument('--geo', action='store_true', help='Geospatial processing')
 	# Execute API-backed enrichment stage (Wikipedia abstracts)
 	parser.add_argument('--apis', action='store_true', help='Update API-backed enrichment datasets like Wikipedia abstracts')
+	# Execute litmus validation stage against packaged release artifacts
+	parser.add_argument('--litmus', action='store_true', help='Run litmus checks against release parquet and write summary to manifest')
 	# Enable S3-compatible storage backend for canopy data paths
 	parser.add_argument('--s3', action='store_true', help='Use configured S3 storage backend instead of local storage')
 	# Parse CLI args (or injected argv from wrapper)
@@ -72,8 +74,10 @@ async def main(argv=None):
 		had_errors = False
 		# Collect per-source processing metadata for downstream fusion/diff
 		results = {}
-		# Run source stage when explicitly requested or when no later-only flags were provided
-		run_processing = args.process or args.download or not any([args.fuse, args.geo, args.apis])
+		# Detect default no-flag canopy run and execute full pipeline in that mode
+		run_full_default = not any([args.download, args.process, args.fuse, args.geo, args.apis, args.litmus])
+		# Run source stage when explicitly requested, during download-only mode, or in full default flow
+		run_processing = args.process or args.download or run_full_default
 		# Start dataset execution stage when requested
 		if run_processing:
 			# Build optional user-agent header set for outbound source requests
@@ -127,13 +131,13 @@ async def main(argv=None):
 			# Mark authoritative download checkpoint only for full-source runs
 			if not args.dataset: set_checkpoint('download')
 			# Explain why follow-up stages are skipped
-			mesologger.info('Download-only run complete, skipping process/fuse/geo/apis steps')
+			mesologger.info('Download-only run complete, skipping process/fuse/geo/apis/litmus steps')
 			# No release object is produced in download-only runs
 			return None
 		# Initialize release metadata container for downstream stages
 		release = None
-		# Run fusion stage only when explicitly requested
-		if args.fuse:
+		# Run fusion stage when explicitly requested or during full default flow
+		if args.fuse or run_full_default:
 			# Isolate fusion errors so other diagnostics still print cleanly
 			try:
 				# Import fusion entrypoint lazily to avoid heavy import cost on download-only runs
@@ -160,8 +164,8 @@ async def main(argv=None):
 			mesologger.critical('Canopy stage errors detected')
 			# Raise to preserve non-zero process semantics
 			raise RuntimeError('Canopy stage errors detected')
-		# Run geospatial stage only when requested
-		if args.geo:
+		# Run geospatial stage when explicitly requested or during full default flow
+		if args.geo or run_full_default:
 			try:
 				# Import geo stage lazily to avoid optional dependency cost unless needed
 				from .pipeline.geo import compute_geospatial
@@ -174,8 +178,8 @@ async def main(argv=None):
 				mesologger.error(f'Error during geo: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
 				traceback.print_exception(type(e), e, e.__traceback__)
-		# Run API enrichment stage only when requested
-		if args.apis:
+		# Run API enrichment stage when explicitly requested or during full default flow
+		if args.apis or run_full_default:
 			try:
 				# Import Wikipedia updater lazily for optional API dependency paths
 				from .datasets.wikipedia import update_wikipedia
@@ -187,6 +191,20 @@ async def main(argv=None):
 				# Emit concise error summary for quick scanning
 				mesologger.error(f'Error during apis: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging
+				traceback.print_exception(type(e), e, e.__traceback__)
+		# Run litmus when explicitly requested or during full default flow.
+		if args.litmus or run_full_default:
+			try:
+				# Import litmus runner lazily to keep startup costs low.
+				from .pipeline.litmus import run as run_litmus_checks
+				# Execute litmus against current release or latest packaged release.
+				run_litmus_checks(release)
+			except Exception as e:
+				# Mark litmus failure so process exits non-zero.
+				had_errors = True
+				# Emit concise error summary for quick scanning.
+				mesologger.error(f'Error during litmus: {type(e).__name__}: {str(e)}')
+				# Emit full traceback for debugging.
 				traceback.print_exception(type(e), e, e.__traceback__)
 		# Abort with non-zero exit semantics when any stage failed
 		if had_errors:

@@ -164,6 +164,8 @@ async def compute_geospatial(release):
 		gc.collect()
 		# Package habitat, centroids, and elevation outputs into final geo artifact
 		package_data_from_parquet(release, habitat_points_path, centroids_path, elevation_bins_path, elevation_medians_path)
+		# Merge packaged geo payload into the main release parquet inside geo stage
+		embed_geo_into_release_parquet(release)
 	# Always cleanup temporary staging payload files
 	finally:
 		# Remove temporary habitat parquet when present
@@ -213,7 +215,7 @@ def load_occurrences(release: dict) -> pl.DataFrame:
 	# WKB POINT layout: bytes 5..13 = longitude (f64), bytes 13..21 = latitude (f64)
 	compact = (
 		pl.scan_parquet(os.path.join(GEO_DIR, 'occurrences.parquet'))
-		# Only read columns we need
+		# Only read columns we need from synonym-normalized occurrence output
 		.select("taxon", "location", "elevation", "spatial_issue")
 		# Filter spatial issues first
 		.filter(~pl.col("spatial_issue"))
@@ -548,7 +550,7 @@ def build_habitat_for_release(release: dict) -> tuple[pl.DataFrame, pl.DataFrame
 		.join(fallback_taxa, on='gbif_id', how='inner')
 	)
 	# Log low-tile fallback taxon count
-	mesologger.warning(f"Prepared {len(raw_fallback_arrays):,} raw centroid fallback taxa (<{HABITAT_TILE_THRESHOLD} tiles)")
+	mesologger.info(f"Prepared {len(raw_fallback_arrays):,} raw centroid fallback taxa (<{HABITAT_TILE_THRESHOLD} tiles)")
 	# Roll elevation bins recursively above family to top-level taxa
 	elevation_bins = rollup_elevation_to_parents(low_bins, parentage)
 	# Release low-bin and pre-roll habitat rows before finalization
@@ -792,7 +794,7 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 	# Track total taxa prepared for clustering
 	total_records = weighted_count + fallback_count
 	# Log split counts for weighted and fallback modes
-	mesologger.warning(f"Prepared {weighted_count:,} weighted taxa and {fallback_count:,} raw fallback taxa")
+	mesologger.info(f"Prepared {weighted_count:,} weighted taxa and {fallback_count:,} raw fallback taxa")
 	# Stream worker input records instead of materializing one huge Python list
 	def record_iter():
 		# Yield weighted clustering records first
@@ -926,3 +928,47 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 	release['geo'] = filename
 	# Persist release manifest with new geo artifact reference
 	storage.write_json(os.path.join(release_dir, 'manifest.json'), release)
+
+# Merge packaged geo payload into the main release parquet for accepted taxa
+def embed_geo_into_release_parquet(release: dict):
+	# Resolve release version for path construction
+	version = release.get('version')
+	# Resolve release directory for parquet and temp paths
+	release_dir = os.path.join(RELEASES_DIR, version)
+	# Resolve main release parquet path
+	release_parquet = os.path.join(release_dir, f"{version}.parquet")
+	# Resolve packaged geo parquet path from manifest payload
+	geo_parquet = os.path.join(release_dir, release.get('geo'))
+	# Resolve temporary output parquet used during rewrite
+	temp_parquet = os.path.join(release_dir, f"{version}.withgeo.tmp.parquet")
+	# Build DuckDB-readable URL for main release parquet
+	release_parquet_url = storage.parquet_url(release_parquet)
+	# Build DuckDB-readable URL for geo parquet
+	geo_parquet_url = storage.parquet_url(geo_parquet)
+	# Build DuckDB-readable URL for temporary rewritten release parquet
+	temp_parquet_url = storage.parquet_url(temp_parquet)
+	# Announce geo embedding stage inside canopy geo pipeline
+	mesologger.info(f"Embedding geo payload into release parquet {version}")
+	# Open in-memory DuckDB for parquet rewrite
+	with duckdb.connect(':memory:') as db:
+		# Configure DuckDB S3 settings when reading/writing object storage paths
+		if storage.is_s3(): storage.configure_duckdb(db)
+		# Load current release rows into a temporary mutable table
+		db.execute(f"CREATE TEMP TABLE meso AS SELECT * FROM read_parquet('{release_parquet_url}')")
+		# Load packaged geo payload into a temporary view for join updates
+		db.execute(f"CREATE TEMP VIEW geo_parquet AS SELECT * FROM read_parquet('{geo_parquet_url}')")
+		# Ensure geo JSON column exists before update
+		db.execute("ALTER TABLE meso ADD COLUMN IF NOT EXISTS geo JSON")
+		# Merge geo payload for accepted rows with matching GBIF ids
+		db.execute("""
+			UPDATE meso m SET geo = json_object('habitat', g.habitat, 'maxhab', g.max, 'avghab', g.avg, 'centroids', g.centroids, 'elevation', g.elevation, 'hypsogram', g.elevation_profile)
+			FROM geo_parquet g WHERE m.accepted AND m.gbif_id = g.gbif_id
+		""")
+		# Write rewritten release parquet with embedded geo payload to temporary path
+		db.execute(f"COPY (SELECT * FROM meso) TO '{temp_parquet_url}' (FORMAT PARQUET)")
+	# Replace release parquet with rewritten temp parquet
+	storage.copy(temp_parquet, release_parquet)
+	# Remove temporary rewrite parquet after successful replacement
+	storage.delete(temp_parquet)
+	# Log completion of geo embedding rewrite
+	mesologger.info(f"Embedded geo payload into {release_dir}/{version}.parquet")

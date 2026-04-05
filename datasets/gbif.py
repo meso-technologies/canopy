@@ -61,6 +61,8 @@ def process_gbif(source: dict):
 				CAST(taxonID AS UINTEGER) AS id_raw,
 			 	lower(scientificName) AS name_clean,
 			 	CAST(parentNameUsageID AS UINTEGER) AS parent_raw,
+				-- Keep acceptedNameUsageID so synonym occurrences can map to accepted GBIF keys
+				CAST(acceptedNameUsageID AS UINTEGER) AS accepted_raw,
 			 	scientificNameAuthorship AS author_raw,
 			 	taxonRank AS rank_raw,
 				-- hierarchy from Taxon.tsv, noisy but broad coverage
