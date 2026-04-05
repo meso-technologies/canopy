@@ -734,6 +734,13 @@ def cluster_points_raw(x_coords: list, y_coords: list) -> list:
 	# Dedupe is performed once in DuckDB during package_data
 	return [points[i[0]].tolist() for i in idx]
 
+# Configure one clustering worker process to avoid FAISS thread over-subscription
+# Keep this as a top-level function so multiprocessing can pickle it for Pool initializer usage,
+# especially on spawn-based platforms like Windows where lambdas/closures are not safe initializers.
+def init_cluster_worker():
+	# Keep one FAISS OpenMP thread per worker process
+	faiss.omp_set_num_threads(1)
+
 # Cluster one row tuple inside a worker process
 def cluster_worker(record: tuple) -> dict:
 	# Unpack worker input tuple
@@ -807,7 +814,7 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 	# Hold clustered rows
 	rows = []
 	# Open worker pool for parallel clustering
-	with mp.Pool(processes=workers) as pool:
+	with mp.Pool(processes=workers, initializer=init_cluster_worker) as pool:
 		# Iterate results as workers complete tasks
 		for idx, row in enumerate(pool.imap_unordered(cluster_worker, record_iter(), chunksize=64), start=1):
 			# Append clustered row

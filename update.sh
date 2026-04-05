@@ -41,6 +41,19 @@ resolve_winget() {
 	return 1
 }
 
+run_with_optional_sudo() {
+	if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+		"$@"
+		return $?
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		sudo "$@"
+		return $?
+	fi
+	echo "CANOPY : sudo not found and current user is not root"
+	return 1
+}
+
 install_with_platform_package_manager() {
 	local pkg="$1"
 	local winget_id="${2:-}"
@@ -59,16 +72,16 @@ install_with_platform_package_manager() {
 		fi
 	else
 		if command -v apt-get >/dev/null 2>&1; then
-			sudo apt-get update || true
-			sudo apt-get install -y "$pkg" || true
+			run_with_optional_sudo apt-get update || true
+			run_with_optional_sudo apt-get install -y "$pkg" || true
 		elif command -v dnf >/dev/null 2>&1; then
-			sudo dnf install -y "$pkg" || true
+			run_with_optional_sudo dnf install -y "$pkg" || true
 		elif command -v yum >/dev/null 2>&1; then
-			sudo yum install -y "$pkg" || true
+			run_with_optional_sudo yum install -y "$pkg" || true
 		elif command -v pacman >/dev/null 2>&1; then
-			sudo pacman -Sy --noconfirm "$pkg" || true
+			run_with_optional_sudo pacman -Sy --noconfirm "$pkg" || true
 		elif command -v zypper >/dev/null 2>&1; then
-			sudo zypper --non-interactive install "$pkg" || true
+			run_with_optional_sudo zypper --non-interactive install "$pkg" || true
 		fi
 	fi
 }
