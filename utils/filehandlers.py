@@ -11,7 +11,7 @@ from ..utils.s3 import storage
 # Load run-state helper to persist latest source download/process metadata
 from ..utils.state import update_source_state
 
-# Track wrapper-distilled release artifact prefixes for cleanup logic
+# Track distilled release artifact prefixes for cleanup logic
 releasefiles = ['precog','typesense','postgres','taxonext','citations','timeline','rarities']
 
 # Fetch source metadata, optionally download updates, and decide whether processing is needed
@@ -23,10 +23,14 @@ async def fetch(session, source: dict) -> bool:
 		source['timestamp_download'] = int(latest_download.split('.')[1])
 		mesologger.info(f"Latest local version of { source['name'] } is from { source['timestamp_download'] }")
 	else: mesologger.info(f"No local { source['name'] } version available")
+	# Track whether this fetch call downloaded a newer source artifact
+	source['download_updated'] = False
 	# Check for remote version
-	if settings.CHECK_FOR_DOWNLOADS: 
-		# See if we have a new file successfully downloaded
-		if await pull(session, source): mesologger.info(f"Successfully fetched new remote version of { source['name'] }.")
+	if settings.CHECK_FOR_DOWNLOADS:
+		# Try downloading when a newer remote source exists
+		source['download_updated'] = bool(await pull(session, source))
+		# Log successful source refresh for checkpoint gating visibility
+		if source['download_updated']: mesologger.info(f"Successfully fetched new remote version of { source['name'] }.")
 	# Ensure source processing path is available locally for downstream zip/gzip consumers
 	if source.get('latest_download'):
 		# Build canonical source path under canopy source directory
@@ -46,7 +50,10 @@ async def fetch(session, source: dict) -> bool:
 	# Use explicit None check so legacy datehash 0 files still count as available local sources
 	if source.get('timestamp_download') is None: return False
 	# Persist latest known source metadata into shared state manifest
-	update_source_state(source, 'fetch')
+	# Mark fetch stage only when this run actually downloaded a newer source file
+	if source.get('download_updated'): update_source_state(source, 'fetch')
+	# Otherwise update metadata only and keep the previous successful stage marker
+	else: update_source_state(source)
 	# Check if we need to process
 	if not source.get('timestamp_processed') or (source.get('timestamp_download') and source.get('timestamp_processed') < source.get('timestamp_download')):
 		mesologger.info(f"Processed { source['name']} version outdated, we have { source.get('timestamp_processed') } but { source.get('timestamp_download') } is available.")

@@ -128,8 +128,16 @@ async def main(argv=None):
 						traceback.print_exception(type(e), e, e.__traceback__)
 		# Exit after downloads when explicitly running download-only mode
 		if runtime.DOWNLOAD_ONLY:
-			# Mark authoritative download checkpoint only for full-source runs
-			if not args.dataset: set_checkpoint('download')
+			# Mark authoritative download checkpoint only for full-source runs with at least one refreshed source
+			if not args.dataset:
+				# Count refreshed sources from fetch metadata used by orchestrator checkpoint gating
+				updated_sources = [name for name, source in results.items() if source.get('download_updated')]
+				# Stamp checkpoint only when at least one source downloaded a newer file
+				if updated_sources:
+					set_checkpoint('download')
+					mesologger.info(f"Download checkpoint updated after {len(updated_sources)} refreshed sources")
+				# Keep previous checkpoint unchanged when no source changed remotely
+				else: mesologger.info('No source updates downloaded, download checkpoint unchanged')
 			# Explain why follow-up stages are skipped
 			mesologger.info('Download-only run complete, skipping process/fuse/geo/apis/litmus steps')
 			# No release object is produced in download-only runs
