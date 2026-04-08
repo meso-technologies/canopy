@@ -1037,11 +1037,11 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 			# Build one partition of geo payload from iteratively normalized habitat_work
 			db.execute(f"""
 				COPY (
-					WITH habitat_part AS (SELECT gbif_id, array_agg(struct_pack(lng := center_lng, lat := center_lat, occ := count) ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC)::JSON AS habitat, max(count) AS max, avg(count) AS avg FROM habitat_work GROUP BY gbif_id),
+					WITH habitat_part AS (SELECT gbif_id, array_agg(struct_pack(lng := center_lng, lat := center_lat, occ := count) ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC)::JSON AS habitat, max(count) AS max, avg(count) AS avg, sum(count) AS observations FROM habitat_work GROUP BY gbif_id),
 					centroid_clean AS (SELECT gbif_id, list_distinct(list_transform(centroids, coord -> [coord[1]::DECIMAL(8,4), coord[2]::DECIMAL(8,4)]))::JSON AS centroids FROM read_parquet('{centroids_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}),
 					elevation_profile_clean AS (SELECT gbif_id, array_agg(struct_pack(elevation := elevation_bin, occ := bin_count) ORDER BY elevation_bin)::JSON AS elevation_profile FROM read_parquet('{elevation_bins_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part} GROUP BY gbif_id),
 					elevation_medians_clean AS (SELECT gbif_id, cast(elevation AS SMALLINT) AS elevation FROM read_parquet('{elevation_medians_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part})
-					SELECT h.gbif_id, h.habitat, h.max, h.avg, c.centroids, m.elevation, ep.elevation_profile
+					SELECT h.gbif_id, h.habitat, h.max, h.avg, h.observations, c.centroids, m.elevation, ep.elevation_profile
 					FROM habitat_part h
 					LEFT JOIN centroid_clean c ON h.gbif_id = c.gbif_id
 					LEFT JOIN elevation_profile_clean ep ON h.gbif_id = ep.gbif_id
@@ -1097,7 +1097,7 @@ def embed_geo_into_release_parquet(release: dict):
 		db.execute("ALTER TABLE meso ADD COLUMN IF NOT EXISTS geo JSON")
 		# Merge geo payload for accepted rows with matching GBIF ids
 		db.execute("""
-			UPDATE meso m SET geo = json_object('habitat', g.habitat, 'maxhab', g.max, 'avghab', g.avg, 'centroids', g.centroids, 'elevation', g.elevation, 'hypsogram', g.elevation_profile)
+			UPDATE meso m SET geo = json_object('habitat', g.habitat, 'maxhab', g.max, 'avghab', g.avg, 'observations', g.observations, 'centroids', g.centroids, 'elevation', g.elevation, 'hypsogram', g.elevation_profile)
 			FROM geo_parquet g WHERE m.accepted AND m.gbif_id = g.gbif_id
 		""")
 		# Write rewritten release parquet with embedded geo payload to temporary path

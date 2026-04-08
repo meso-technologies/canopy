@@ -30,15 +30,34 @@ checks = [
 	# This catches broad acceptance regressions before we inspect individual taxa.
 	# Query returns one row only when the floor is satisfied.
 	(
-		'accepted_species_floor',
+		'accepted_taxa_floor',
 		"""
-		-- Require a minimum accepted species count in final meso output.
+		-- Require a minimum accepted taxa count in final meso output.
 		SELECT 1
-		FROM (SELECT COUNT(*) AS accepted_species FROM meso WHERE accepted AND rank_consensus = 'SPECIES')
-		WHERE accepted_species >= 620000
+		FROM (SELECT COUNT(*) AS accepted_taxa FROM meso WHERE accepted)
+		WHERE accepted_taxa >= 700000
 		""",
 		'any',
-		'Accepted species count below floor 620000'
+		'Accepted taxa count below floor 700000'
+	),
+	# Guard critical detail-volume floors used by downstream taxonomy UX surfaces.
+	# Litmus is meso-only and reads observations from embedded geo scalar totals.
+	# Query returns one row only when all three floors are satisfied.
+	(
+		'taxon_detail_floor',
+		"""
+		-- Require minimum detail volumes from final meso output only.
+		SELECT 1
+		FROM (
+			SELECT
+				(SELECT COALESCE(SUM(CAST(json_extract_string(geo, '$.observations') AS BIGINT)), 0) FROM meso WHERE accepted AND geo IS NOT NULL) AS total_occurrences,
+				(SELECT COALESCE(SUM(len(names)), 0) FROM (SELECT unnest(map_values(vernacular)) AS names FROM meso WHERE accepted AND vernacular IS NOT NULL) v) AS total_vernacular,
+				(SELECT COUNT(*) FROM meso WHERE wikipedia_page IS NOT NULL AND trim(wikipedia_page) <> '') AS total_abstracts
+		)
+		WHERE total_occurrences > 520000000 AND total_vernacular > 1000000 AND total_abstracts > 100000
+		""",
+		'any',
+		'Taxon detail floor failed occurrences vernacular or abstracts below threshold'
 	),
 	# Lock two concrete NCBI regressions that previously broke in production.
 	# We intentionally compare exact expected IDs, not just non-null presence.
