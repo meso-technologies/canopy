@@ -28,8 +28,6 @@ import gc
 from datetime import datetime, timezone
 # Multiprocessing for faster centroid clustering
 import multiprocessing as mp
-# Mercator projection constants
-import math
 # NumPy arrays for FAISS inputs
 import numpy as np
 # FAISS kmeans backend for centroid clustering
@@ -47,8 +45,6 @@ from ..datasets.occurrences import update_occurrences
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
 
-# Mercator latitude limit — beyond this the projection is undefined
-MAX_LAT = 85.0511
 # QuadKey zoom level — level 10 gives ~39km × 20km tiles at the equator
 TILE_LEVEL = 10
 # Number of tiles per axis at this zoom level
@@ -59,28 +55,38 @@ FAISS_DIMS = 2
 FAISS_RANGE_RADIUS = 5.0
 # Keep FAISS centroid diversity threshold aligned with legacy geo clustering
 FAISS_DIVERSITY_DISTANCE = 9.0
-# Keep raw occurrence rollup capped at family-level parent ranks
+# Keep raw occurrence rollup capped at species-level parent ranks
 RAW_ROLLUP_PARENT_RANKS = [
 	"FORM",
 	"VARIETY",
 	"SUBSPECIES",
 	"SPECIES",
-	"SUBGENUS",
+]
+# Prefer direct raw centroid clustering for genus-and-above taxa with enough direct observations
+RAW_DIRECT_MIN_OCC = 300
+# Keep direct-raw centroid preference scoped to genus-and-above ranks
+RAW_DIRECT_RANKS = [
 	"GENUS",
 	"SUBTRIBE",
 	"TRIBE",
 	"SUBFAMILY",
 	"FAMILY",
+	"ORDER",
+	"CLASS",
+	"PHYLUM",
+	"KINGDOM",
 ]
-# Process habitat tile computation in taxon batches to control peak memory
-HABITAT_BATCH_TAXA = 20000
+# Habitat tiles at or above this occurrence count stay separate and are never coarsened
+HABITAT_GUARD_OCC_THRESHOLD = 50000
+# Keep packaged habitat target tile count per taxon for frontend payload budget
+HABITAT_TARGET_TILES = 25000
+# Cap iterative tail coarsening passes in packaging to bound runtime
+HABITAT_COARSEN_MAX_ITER = 8
 # Keep elevation profile granularity at 100m bins
 ELEVATION_BIN_SIZE = 100
 # Keep legacy-style raw fallback cutoff based on habitat tile cardinality
 # Below this threshold we cluster raw occurrences; at and above it we cluster weighted habitat tiles
 HABITAT_TILE_THRESHOLD = 100
-# Cap packaged habitat tile count per taxon for frontend map performance via adaptive coarsening
-HABITAT_DISPLAY_CAP = 20000
 # Split packaging into deterministic hash partitions to cap peak memory during habitat aggregation
 PACKAGE_PARTITIONS = 16
 
@@ -122,12 +128,14 @@ async def compute_geospatial(release):
 		mesologger.info('No occurrences.parquet available, skipping geo step')
 		# Stop stage due to missing input
 		return
-	# Build habitat points, raw fallback arrays, and in-memory elevation payloads
-	habitat_points, raw_fallback_arrays, elevation_bins, elevation_medians = build_habitat_for_release(release)
+	# Build habitat points, raw fallback arrays, direct raw arrays, and in-memory elevation payloads
+	habitat_points, raw_fallback_arrays, direct_raw_arrays, elevation_bins, elevation_medians = build_habitat_for_release(release)
 	# Resolve temporary parquet path for habitat payload
 	habitat_points_path = os.path.join(TMP_DIR, f"geo_habitat_points_{release.get('version')}.parquet")
 	# Resolve temporary parquet path for raw fallback payload
 	raw_fallback_path = os.path.join(TMP_DIR, f"geo_raw_fallback_{release.get('version')}.parquet")
+	# Resolve temporary parquet path for direct raw centroid payload
+	direct_raw_path = os.path.join(TMP_DIR, f"geo_direct_raw_{release.get('version')}.parquet")
 	# Resolve temporary parquet path for centroid payload
 	centroids_path = os.path.join(TMP_DIR, f"geo_centroids_{release.get('version')}.parquet")
 	# Resolve temporary parquet path for elevation profile payload
@@ -138,6 +146,8 @@ async def compute_geospatial(release):
 	habitat_points.write_parquet(habitat_points_path)
 	# Persist raw fallback payload before clustering for legacy low-tile behavior
 	raw_fallback_arrays.write_parquet(raw_fallback_path)
+	# Persist direct raw payload before clustering for genus-and-above direct-observation preference
+	direct_raw_arrays.write_parquet(direct_raw_path)
 	# Persist elevation profile bins before clustering to reduce resident memory during worker spawn
 	elevation_bins.write_parquet(elevation_bins_path)
 	# Persist elevation medians before clustering to reduce resident memory during worker spawn
@@ -146,6 +156,8 @@ async def compute_geospatial(release):
 	del habitat_points
 	# Drop in-memory raw fallback payload before opening FAISS multiprocessing pool
 	del raw_fallback_arrays
+	# Drop in-memory direct raw payload before opening FAISS multiprocessing pool
+	del direct_raw_arrays
 	# Drop in-memory elevation payloads before opening FAISS multiprocessing pool
 	del elevation_bins
 	# Drop in-memory median payloads before opening FAISS multiprocessing pool
@@ -154,8 +166,8 @@ async def compute_geospatial(release):
 	gc.collect()
 	# Wrap clustering + packaging so temporary files are cleaned on both success and failure
 	try:
-		# Build representative centroid points per taxon from staged habitat and fallback parquets
-		clustered_centroids = find_clusters_from_parquet(habitat_points_path, raw_fallback_path)
+		# Build representative centroid points per taxon from staged habitat and raw-source parquets
+		clustered_centroids = find_clusters_from_parquet(habitat_points_path, raw_fallback_path, direct_raw_path)
 		# Persist centroid payload for parquet-backed packaging
 		clustered_centroids.write_parquet(centroids_path)
 		# Drop in-memory centroids before DuckDB packaging stage
@@ -172,24 +184,14 @@ async def compute_geospatial(release):
 		if os.path.isfile(habitat_points_path): os.remove(habitat_points_path)
 		# Remove temporary raw fallback parquet when present
 		if os.path.isfile(raw_fallback_path): os.remove(raw_fallback_path)
+		# Remove temporary direct raw parquet when present
+		if os.path.isfile(direct_raw_path): os.remove(direct_raw_path)
 		# Remove temporary centroid parquet when present
 		if os.path.isfile(centroids_path): os.remove(centroids_path)
 		# Remove temporary elevation bin parquet when present
 		if os.path.isfile(elevation_bins_path): os.remove(elevation_bins_path)
 		# Remove temporary elevation median parquet when present
 		if os.path.isfile(elevation_medians_path): os.remove(elevation_medians_path)
-
-# Reverse tile_id to tile center longitude
-def tile_center_lng(tile_id: pl.Expr) -> pl.Expr:
-	# tile_x = tile_id // TILE_COUNT, center at +0.5
-	return (((tile_id // TILE_COUNT).cast(pl.Float64) + 0.5) / TILE_COUNT * 360.0 - 180.0).round(3)
-
-# Reverse tile_id to tile center latitude via inverse Mercator
-def tile_center_lat(tile_id: pl.Expr) -> pl.Expr:
-	# tile_y = tile_id % TILE_COUNT, center at +0.5
-	n = math.pi - 2.0 * math.pi * ((tile_id % TILE_COUNT).cast(pl.Float64) + 0.5) / TILE_COUNT
-	# inverse Mercator: lat = arctan(sinh(n))
-	return ((n.exp() - (n * -1).exp()) * 0.5).arctan().degrees().round(3)
 
 # Load occurrences from geoparquet, extract coordinates, filter to accepted taxa, pack per taxon
 def load_occurrences(release: dict) -> pl.DataFrame:
@@ -277,11 +279,11 @@ def load_parentage(release: dict) -> pl.DataFrame:
 	# Return parent edge table
 	return parentage
 
-# Roll up occurrences to family and below by concatenating children's arrays
+# Roll up occurrences to species and below by concatenating children's arrays
 def rollup_to_parents(compact: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
 	# Announce lower-rank rollup stage
-	mesologger.info(f"Rolling up occurrences to family-level parents")
-	# Keep only edges whose parent rank is family or below
+	mesologger.info(f"Rolling up occurrences to species-level parents")
+	# Keep only edges whose parent rank is species or below
 	low_parentage = parentage.filter(pl.col("parent_rank").is_in(RAW_ROLLUP_PARENT_RANKS)).select("gbif_id", "parent_gbif")
 	# Seed recursive frontier with direct occurrences for all taxa
 	frontier = compact
@@ -322,52 +324,6 @@ def rollup_to_parents(compact: pl.DataFrame, parentage: pl.DataFrame) -> pl.Data
 	# Return compact table with lower-rank recursive aggregation applied
 	return rolled
 
-# Build habitat tile counts from one compact batch using tile math + value_counts
-def build_habitat_tile_batch(compact_batch: pl.DataFrame) -> pl.DataFrame:
-	# Compute tile coordinates and count occurrences per tile using list.eval
-	return (
-		compact_batch
-		.with_columns(
-			pl.col("lng").list.eval(
-				((pl.element().cast(pl.Float64) + 180.0) / 360.0 * TILE_COUNT).clip(0, TILE_COUNT - 1).cast(pl.UInt32)
-			).alias("tx"),
-			pl.col("lat").list.eval(
-				((1.0 - ((pl.element().cast(pl.Float64).clip(-MAX_LAT, MAX_LAT) * (math.pi / 180.0)).tan() +
-					(1.0 / (pl.element().cast(pl.Float64).clip(-MAX_LAT, MAX_LAT) * (math.pi / 180.0)).cos())).log()
-					/ math.pi) / 2.0 * TILE_COUNT).clip(0, TILE_COUNT - 1).cast(pl.UInt32)
-			).alias("ty"),
-		)
-		.with_columns(
-			(pl.col("tx").list.eval(pl.element() * TILE_COUNT) + pl.col("ty"))
-			.list.eval(pl.element().value_counts(sort=True))
-			.alias("tile_counts")
-		)
-		.select("taxon", "tile_counts")
-		.explode("tile_counts")
-		.unnest("tile_counts")
-		.rename({"": "tile_id", "taxon": "gbif_id"})
-		.select("gbif_id", "tile_id", "count")
-	)
-
-# Build habitat tile counts from compact occurrence arrays using chunked batches
-def build_habitat_tiles(compact: pl.DataFrame) -> pl.DataFrame:
-	# Announce habitat tile computation stage
-	mesologger.info(f"Building habitat tile counts")
-	# Hold per-batch habitat outputs
-	chunks = []
-	# Iterate taxon batches to reduce peak allocations
-	for start in range(0, len(compact), HABITAT_BATCH_TAXA):
-		# Slice current compact batch
-		batch = compact.slice(start, HABITAT_BATCH_TAXA)
-		# Build habitat tile rows for current batch
-		chunks.append(build_habitat_tile_batch(batch))
-	# Merge all chunk outputs and sum duplicate keys once
-	habitat_tiles = pl.concat(chunks, how="vertical").group_by("gbif_id", "tile_id").agg(pl.col("count").sum().alias("count"))
-	# Log habitat tile stats
-	mesologger.info(f"Computed {len(habitat_tiles):,} habitat tiles across {habitat_tiles['gbif_id'].n_unique():,} taxa")
-	# Return flat habitat tile table
-	return habitat_tiles
-
 # Build exact low-rank median elevations and low-rank elevation profile bins from arrays
 def build_low_elevation_stats(compact: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
 	# Announce low-rank elevation computation stage
@@ -397,46 +353,145 @@ def build_low_elevation_stats(compact: pl.DataFrame) -> tuple[pl.DataFrame, pl.D
 	# Return exact low medians and low profile bins
 	return low_medians, low_bins
 
-# Roll up habitat tile counts above family to avoid kingdom-scale raw occurrence arrays
-def rollup_habitat_to_parents(habitat_tiles: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
-	# Announce upper-rank habitat rollup stage
-	mesologger.info(f"Rolling up habitat tiles above family")
-	# Keep only edges whose parent rank is above family cutoff
-	high_parentage = parentage.filter(~pl.col("parent_rank").is_in(RAW_ROLLUP_PARENT_RANKS)).select("gbif_id", "parent_gbif")
-	# Seed recursive frontier with all current habitat rows
-	frontier = habitat_tiles.select("gbif_id", "tile_id", "count")
-	# Keep direct and rolled habitat contributions for one final merge
-	rollup_parts = [frontier]
-	# Iterative rollup — propagate tile counts upward one level at a time
-	level = 0
-	while True:
-		# Build next frontier by summing child tile counts into direct parents
-		frontier = (
-			frontier
-			.join(high_parentage, on="gbif_id", how="inner")
-			.group_by("parent_gbif", "tile_id")
-			.agg(pl.col("count").sum().alias("count"))
-			.rename({"parent_gbif": "gbif_id"})
-			.with_columns(pl.col("gbif_id").cast(habitat_tiles.schema["gbif_id"]))
-		)
-		# Stop when no more upper-rank parents receive contributions
-		if frontier.is_empty(): break
-		# Track level count for logs
-		level += 1
-		# Save this level's contributions for final merge
-		rollup_parts.append(frontier)
-		# Log level progress
-		mesologger.info(f"High rollup level {level}: rolled into {frontier['gbif_id'].n_unique():,} parent taxa")
-	# Merge direct habitat with all upper-rank contributions
-	rolled = (
-		pl.concat(rollup_parts, how="vertical")
-		.group_by("gbif_id", "tile_id")
-		.agg(pl.col("count").sum().alias("count"))
-	)
-	# Log upper-rank rollup stats
-	mesologger.info(f"High rollup complete: {rolled['gbif_id'].n_unique():,} taxa with habitat")
-	# Return full recursive habitat tile table
-	return rolled
+# Build species-seeded habitat with observed tile centers and guarded upper-rank rollup
+# Uses DuckDB recursive table propagation because keyed guarded merge is more robust there.
+def build_habitat_species_up_guarded(occurrence_rolled: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
+	# Announce habitat map + parent rollup stage
+	mesologger.info(f"Building habitat maps and parent rollup:")
+	# Open in-memory DuckDB for habitat rollup construction
+	with duckdb.connect(':memory:') as db:
+		# Start stage timer for habitat rollup visibility
+		stage_t0 = datetime.now(timezone.utc)
+		# Route temporary spill files to canopy temp directory
+		db.execute(f"SET temp_directory = '{TMP_DIR}'")
+		# Allow DuckDB to optimize grouping without preserving insertion order
+		db.execute("SET preserve_insertion_order = false")
+		# Keep large Arrow buffers enabled for wide payload safety
+		db.execute("SET arrow_large_buffer_size=true")
+		# Register parentage frame as DuckDB table
+		db.register('parentage_df', parentage.to_arrow())
+		# Register rolled occurrence arrays as DuckDB table
+		db.register('occurrence_rolled_df', occurrence_rolled.to_arrow())
+		# Build SQL literal list for low-rank boundary used in parent-edge filter
+		low_rank_sql = ','.join([f"'{rank}'" for rank in RAW_ROLLUP_PARENT_RANKS])
+		# Build high-rank parent edges above species boundary
+		step_t0 = datetime.now(timezone.utc)
+		db.execute(f"""
+			CREATE TEMP TABLE high_parentage AS
+			SELECT gbif_id, parent_gbif
+			FROM parentage_df
+			WHERE parent_rank NOT IN ({low_rank_sql});
+		""")
+		# Log high-parent edge build duration
+		mesologger.info(f"Prepared high-rank parent edges in {(datetime.now(timezone.utc) - step_t0).total_seconds():.1f}s")
+		# Build seed habitat from rolled occurrence arrays with observed bbox centers per taxon tile
+		step_t0 = datetime.now(timezone.utc)
+		db.execute(f"""
+			CREATE TEMP TABLE seed_habitat AS
+			WITH
+			-- Expand rolled arrays into point rows
+			occ AS (SELECT taxon AS gbif_id, unnest(lng) AS lng, unnest(lat) AS lat FROM occurrence_rolled_df),
+			-- Collapse repeated rounded coordinates before tile projection
+			occ_unique AS (SELECT gbif_id, lng, lat, count(*)::BIGINT AS n FROM occ GROUP BY gbif_id, lng, lat),
+			-- Map each unique coordinate to zoom-10 tile id
+			occ_tiles AS (SELECT gbif_id, CAST(floor(least(greatest(((lng + 180.0) / 360.0) * {TILE_COUNT}, 0.0), {TILE_COUNT - 1.0})) * {TILE_COUNT} + floor(least(greatest(((1.0 - ln(tan(radians(least(greatest(lat, -85.05112878), 85.05112878))) + 1.0 / cos(radians(least(greatest(lat, -85.05112878), 85.05112878)))) / pi()) / 2.0) * {TILE_COUNT}, 0.0), {TILE_COUNT - 1.0})) AS UINTEGER) AS tile_id, lng, lat, n FROM occ_unique)
+			-- Build observed center and summed count for each taxon tile
+			SELECT gbif_id, tile_id, (min(lng) + max(lng)) / 2.0 AS center_lng, (min(lat) + max(lat)) / 2.0 AS center_lat, sum(n)::BIGINT AS count
+			FROM occ_tiles
+			GROUP BY gbif_id, tile_id;
+		""")
+		# Log seed habitat build duration and row count
+		seed_rows = db.execute("SELECT COUNT(*) FROM seed_habitat").fetchone()[0]
+		mesologger.info(f"Prepared {seed_rows:,} seed habitat rows in {(datetime.now(timezone.utc) - step_t0).total_seconds():.1f}s")
+		# Build initial propagation frontier with guarded merge keys
+		step_t0 = datetime.now(timezone.utc)
+		db.execute(f"""
+			CREATE TEMP TABLE frontier AS
+			-- Mark rows above guard threshold as unique keys so they never merge again
+			SELECT gbif_id, tile_id, center_lng, center_lat, count, CASE WHEN count > {HABITAT_GUARD_OCC_THRESHOLD} THEN concat('u:', cast(tile_id AS VARCHAR), '#', cast(gbif_id AS VARCHAR)) ELSE concat('m:', cast(tile_id AS VARCHAR)) END AS merge_key
+			FROM seed_habitat;
+		""")
+		# Log first parent-rollup input duration and row count
+		frontier_rows = db.execute("SELECT COUNT(*) FROM frontier").fetchone()[0]
+		mesologger.info(f"Prepared first parent-rollup input with {frontier_rows:,} rows in {(datetime.now(timezone.utc) - step_t0).total_seconds():.1f}s")
+		# Seed empty accumulation table for propagated parent rows
+		db.execute("""
+			CREATE TEMP TABLE accum AS
+			SELECT
+				CAST(NULL AS UINTEGER) AS gbif_id,
+				CAST(NULL AS UINTEGER) AS tile_id,
+				CAST(NULL AS DOUBLE) AS center_lng,
+				CAST(NULL AS DOUBLE) AS center_lat,
+				CAST(NULL AS BIGINT) AS count,
+				CAST(NULL AS VARCHAR) AS merge_key
+			WHERE FALSE;
+		""")
+		# Track recursive level for logs
+		level = 0
+		# Propagate frontier upward until no more parent edges remain
+		while True:
+			# Join current frontier to direct parents
+			db.execute("""
+				CREATE OR REPLACE TEMP TABLE joined AS
+				-- Push current frontier rows to direct parents for this rollup level
+				SELECT h.parent_gbif AS gbif_id, f.tile_id, f.center_lng, f.center_lat, f.count, f.merge_key
+				FROM frontier f
+				JOIN high_parentage h ON f.gbif_id = h.gbif_id;
+			""")
+			# Count joined rows to detect recursion completion
+			joined_rows = db.execute("SELECT COUNT(*) FROM joined").fetchone()[0]
+			# Stop once no new parent rows are produced
+			if not joined_rows: break
+			# Aggregate one parent level while preserving guarded merge keys and anchor centers
+			level_t0 = datetime.now(timezone.utc)
+			db.execute(f"""
+				CREATE OR REPLACE TEMP TABLE next_frontier AS
+				WITH
+				-- Sum counts inside each parent tile and merge key
+				grouped AS (SELECT gbif_id, tile_id, merge_key, sum(count) AS count FROM joined GROUP BY gbif_id, tile_id, merge_key),
+				-- Pick anchor center from densest row in each grouped bucket
+				anchor AS (SELECT gbif_id, tile_id, merge_key, center_lng, center_lat, row_number() OVER (PARTITION BY gbif_id, tile_id, merge_key ORDER BY count DESC, center_lng ASC, center_lat ASC) AS rn FROM joined)
+				-- Keep previous unique keys and promote merged rows above threshold into unique keys
+				SELECT g.gbif_id, g.tile_id, a.center_lng, a.center_lat, g.count,
+					CASE WHEN starts_with(g.merge_key, 'u:') THEN g.merge_key WHEN g.count > {HABITAT_GUARD_OCC_THRESHOLD} THEN concat('u:', cast(g.tile_id AS VARCHAR), '#', cast(g.gbif_id AS VARCHAR)) ELSE concat('m:', cast(g.tile_id AS VARCHAR)) END AS merge_key
+				FROM grouped g JOIN anchor a ON g.gbif_id = a.gbif_id AND g.tile_id = a.tile_id AND g.merge_key = a.merge_key
+				WHERE a.rn = 1;
+			""")
+			# Append propagated level rows for final union
+			db.execute("""
+				INSERT INTO accum
+				SELECT gbif_id, tile_id, center_lng, center_lat, count, merge_key
+				FROM next_frontier;
+			""")
+			# Advance frontier to next level
+			db.execute("""
+				CREATE OR REPLACE TEMP TABLE frontier AS
+				SELECT gbif_id, tile_id, center_lng, center_lat, count, merge_key
+				FROM next_frontier;
+			""")
+			# Track level progress
+			level += 1
+			# Compute current level duration
+			level_secs = (datetime.now(timezone.utc) - level_t0).total_seconds()
+			# Log recursive habitat rollup progress with duration
+			mesologger.info(f"High rollup level {level}: propagated {joined_rows:,} rows in {level_secs:.1f}s")
+		# Build final habitat table: species seeds + guarded propagated parent rows
+		step_t0 = datetime.now(timezone.utc)
+		habitat_points = db.execute("""
+			SELECT gbif_id, tile_id, center_lng, center_lat, count
+			FROM seed_habitat
+			UNION ALL
+			SELECT gbif_id, tile_id, center_lng, center_lat, count
+			FROM accum;
+		""").pl()
+		# Log final union materialization duration
+		mesologger.info(f"Materialized final habitat rows in {(datetime.now(timezone.utc) - step_t0).total_seconds():.1f}s")
+	# Log finalized habitat stats
+	mesologger.info(f"Finalized {len(habitat_points):,} guarded habitat rows across {habitat_points['gbif_id'].n_unique():,} taxa")
+	# Log total stage duration for habitat rollup
+	mesologger.info(f"Completed habitat map + parent rollup stage in {(datetime.now(timezone.utc) - stage_t0).total_seconds():.1f}s")
+	# Return full habitat point table with observed centers
+	return habitat_points
 
 # Roll up elevation profile bins above family using additive bin counts
 def rollup_elevation_to_parents(low_bins: pl.DataFrame, parentage: pl.DataFrame) -> pl.DataFrame:
@@ -506,39 +561,55 @@ def medians_from_elevation_bins(all_bins: pl.DataFrame) -> pl.DataFrame:
 	# Return derived higher-rank medians
 	return result
 
-# Attach tile center coordinates to habitat tile counts for clustering and packaging
-def finalize_habitat_maps(habitat_tiles: pl.DataFrame) -> pl.DataFrame:
-	# Derive center coordinates from tile_id via reverse Mercator math
-	habitat_points = habitat_tiles.with_columns(
-		tile_center_lng(pl.col("tile_id")).alias("center_lng"),
-		tile_center_lat(pl.col("tile_id")).alias("center_lat"),
-	)
-	# Log final habitat point stats
-	mesologger.info(f"Finalized {len(habitat_points):,} habitat points across {habitat_points['gbif_id'].n_unique():,} taxa")
-	# Return habitat points table
-	return habitat_points
 
-# Build habitat, raw fallback centroid inputs, and elevation outputs for a release
-# Keep raw fallback arrays only for low-tile taxa to avoid carrying all raw arrays into clustering
-def build_habitat_for_release(release: dict) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-	# Build species-level occurrence arrays from rolling geoparquet
+# Build habitat, raw fallback centroid inputs, direct raw centroid inputs, and elevation outputs for a release
+def build_habitat_for_release(release: dict) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+	# Build direct occurrence arrays from rolling geoparquet
 	occurrence_compact = load_occurrences(release)
 	# Build parent edge table with rank metadata
 	parentage = load_parentage(release)
-	# Build lower-rank rolled occurrence arrays up to family
+	# Build lower-rank rolled occurrence arrays up to species
 	occurrence_rolled = rollup_to_parents(occurrence_compact, parentage)
-	# Release compact arrays immediately after lower-rank rollup stage
-	del occurrence_compact
 	# Build exact low-rank medians and low-rank elevation bins
 	low_medians, low_bins = build_low_elevation_stats(occurrence_rolled)
-	# Build per-taxon habitat tile counts from rolled occurrence arrays
-	habitat_tiles = build_habitat_tiles(occurrence_rolled)
-	# Roll habitat tile counts recursively above family to top-level taxa
-	habitat_rolled = rollup_habitat_to_parents(habitat_tiles, parentage)
-	# Build per-taxon tile cardinality from rolled habitat for weighted/raw centroid split
-	tile_counts = habitat_rolled.group_by('gbif_id').agg(pl.len().alias('n_tiles'))
+	# Build observed-center species-up habitat from rolled occurrences with guarded upper-rank rollup
+	habitat_points = build_habitat_species_up_guarded(occurrence_rolled, parentage)
+	# Build per-taxon tile cardinality for fallback split logic
+	tile_counts = habitat_points.group_by('gbif_id').agg(pl.len().alias('n_tiles'))
+	# Resolve release parquet for direct-rank lookup
+	release_parquet = os.path.join(RELEASES_DIR, release.get('version'), f"{release.get('version')}.parquet")
+	# Load accepted ranks once for direct-raw source selection
+	taxon_ranks = (
+		pl.scan_parquet(release_parquet)
+		.filter(pl.col('accepted'), pl.col('gbif_id').is_not_null())
+		.select('gbif_id', 'rank_consensus')
+		.collect(engine='streaming')
+	)
+	# Build direct raw arrays for genus-and-above taxa with enough direct observations
+	direct_raw_arrays = (
+		occurrence_compact
+		.select(
+			pl.col('taxon').alias('gbif_id'),
+			pl.col('lng').cast(pl.List(pl.Float32)).alias('x'),
+			pl.col('lat').cast(pl.List(pl.Float32)).alias('y'),
+			pl.col('lng').list.len().alias('n_raw'),
+		)
+		.join(taxon_ranks, on='gbif_id', how='inner')
+		.filter(
+			pl.col('rank_consensus').is_in(RAW_DIRECT_RANKS),
+			pl.col('n_raw') >= RAW_DIRECT_MIN_OCC,
+		)
+		.select('gbif_id', 'x', 'y')
+	)
+	# Collect direct raw taxon ids for exclusion from fallback branch
+	direct_raw_taxa = direct_raw_arrays.select('gbif_id')
 	# Select low-tile taxa for raw occurrence fallback clustering
-	fallback_taxa = tile_counts.filter(pl.col('n_tiles') < HABITAT_TILE_THRESHOLD).select('gbif_id')
+	fallback_taxa = (
+		tile_counts
+		.filter(pl.col('n_tiles') < HABITAT_TILE_THRESHOLD)
+		.select('gbif_id')
+		.join(direct_raw_taxa, on='gbif_id', how='anti')
+	)
 	# Build raw fallback arrays for low-tile taxa only
 	raw_fallback_arrays = (
 		occurrence_rolled
@@ -549,15 +620,12 @@ def build_habitat_for_release(release: dict) -> tuple[pl.DataFrame, pl.DataFrame
 		)
 		.join(fallback_taxa, on='gbif_id', how='inner')
 	)
+	# Log direct raw source taxon count
+	mesologger.info(f"Prepared {len(direct_raw_arrays):,} direct raw centroid taxa (rank>=GENUS and n_raw>={RAW_DIRECT_MIN_OCC})")
 	# Log low-tile fallback taxon count
 	mesologger.info(f"Prepared {len(raw_fallback_arrays):,} raw centroid fallback taxa (<{HABITAT_TILE_THRESHOLD} tiles)")
-	# Roll elevation bins recursively above family to top-level taxa
+	# Roll elevation bins recursively above species to top-level taxa
 	elevation_bins = rollup_elevation_to_parents(low_bins, parentage)
-	# Release low-bin and pre-roll habitat rows before finalization
-	del low_bins
-	del habitat_tiles
-	# Release rolled occurrence arrays immediately after fallback extraction
-	del occurrence_rolled
 	# Build higher-rank median estimates from rolled elevation bins
 	high_medians = medians_from_elevation_bins(elevation_bins)
 	# Merge exact low-rank medians over derived higher-rank medians
@@ -573,16 +641,18 @@ def build_habitat_for_release(release: dict) -> tuple[pl.DataFrame, pl.DataFrame
 			pl.coalesce([pl.col('elevation_low'), pl.col('elevation')]).cast(pl.Int32).alias('elevation'),
 		)
 	)
-	# Release temporary median and parentage frames
+	# Release temporary frames once all outputs are prepared
 	del high_medians
 	del low_medians
+	del low_bins
 	del parentage
-	# Attach center coordinates to rolled habitat tile counts
-	habitat_points = finalize_habitat_maps(habitat_rolled)
-	# Release rolled tile rows immediately after finalization
-	del habitat_rolled
-	# Return habitat points, raw fallback arrays, elevation profile bins, and elevation medians
-	return habitat_points, raw_fallback_arrays, elevation_bins, elevation_medians
+	del taxon_ranks
+	del tile_counts
+	del direct_raw_taxa
+	del occurrence_rolled
+	del occurrence_compact
+	# Return habitat points, raw fallback arrays, direct raw arrays, elevation profile bins, and elevation medians
+	return habitat_points, raw_fallback_arrays, direct_raw_arrays, elevation_bins, elevation_medians
 
 # Cluster one taxon's habitat points with weighted FAISS and weighted neighborhood ranking
 def cluster_points_weighted(x_coords: list, y_coords: list, weights: list) -> list:
@@ -754,8 +824,8 @@ def cluster_worker(record: tuple) -> dict:
 	# Return clustered row payload
 	return {'gbif_id': int(gbif_id), 'centroids': centroids}
 
-# Compute mixed centroid outputs from staged habitat and raw fallback parquets
-def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.DataFrame:
+# Compute mixed centroid outputs from staged habitat, raw fallback, and direct raw parquets
+def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str, direct_raw_path: str) -> pl.DataFrame:
 	# Announce centroid clustering stage
 	mesologger.info(f"Clustering habitat centroids")
 	# Load only clustering columns from staged habitat parquet
@@ -774,27 +844,41 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 			pl.col('count').cast(pl.Float32).alias('w'),
 		)
 	)
-	# Split weighted taxa at tile threshold
-	weighted_arrays = arrays.filter(pl.col('x').list.len() >= HABITAT_TILE_THRESHOLD)
 	# Load low-tile raw fallback arrays from staged parquet
 	raw_fallback_arrays = (
 		pl.scan_parquet(raw_fallback_path)
 		.select('gbif_id', 'x', 'y')
 		.collect(engine='streaming')
 	)
+	# Load direct raw arrays for genus-and-above direct-observation clustering
+	direct_raw_arrays = (
+		pl.scan_parquet(direct_raw_path)
+		.select('gbif_id', 'x', 'y')
+		.collect(engine='streaming')
+	)
+	# Build combined raw-mode taxon id set for weighted anti-join
+	raw_mode_taxa = pl.concat([
+		raw_fallback_arrays.select('gbif_id'),
+		direct_raw_arrays.select('gbif_id'),
+	], how='vertical').unique()
+	# Keep weighted mode only for taxa not selected into raw modes
+	weighted_arrays = arrays.join(raw_mode_taxa, on='gbif_id', how='anti')
 	# Release raw habitat rows and unsplit arrays before worker spawn
 	del habitat
 	del arrays
+	del raw_mode_taxa
 	# Force a collection cycle before spawning workers
 	gc.collect()
 	# Track weighted and raw fallback record counts for logs
 	weighted_count = len(weighted_arrays)
 	# Track raw fallback taxon count for logs
 	fallback_count = len(raw_fallback_arrays)
+	# Track direct raw taxon count for logs
+	direct_count = len(direct_raw_arrays)
 	# Track total taxa prepared for clustering
-	total_records = weighted_count + fallback_count
-	# Log split counts for weighted and fallback modes
-	mesologger.info(f"Prepared {weighted_count:,} weighted taxa and {fallback_count:,} raw fallback taxa")
+	total_records = weighted_count + fallback_count + direct_count
+	# Log split counts for weighted and raw modes
+	mesologger.info(f"Prepared {weighted_count:,} weighted taxa, {fallback_count:,} fallback raw taxa, and {direct_count:,} direct raw taxa")
 	# Stream worker input records instead of materializing one huge Python list
 	def record_iter():
 		# Yield weighted clustering records first
@@ -804,6 +888,10 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 		# Yield raw fallback clustering records second
 		for row in raw_fallback_arrays.iter_rows(named=True):
 			# Emit raw payload expected by worker function
+			yield ('raw', int(row['gbif_id']), row['x'], row['y'], None)
+		# Yield direct raw clustering records third
+		for row in direct_raw_arrays.iter_rows(named=True):
+			# Emit direct raw payload expected by worker function
 			yield ('raw', int(row['gbif_id']), row['x'], row['y'], None)
 	# Choose worker count from CPU capacity (same pattern as high-throughput importer stages)
 	workers = max(1, (os.cpu_count() or 2) - 1)
@@ -826,6 +914,7 @@ def find_clusters_from_parquet(habitat_path: str, raw_fallback_path: str) -> pl.
 	# Release grouped arrays once worker consumption is complete
 	del weighted_arrays
 	del raw_fallback_arrays
+	del direct_raw_arrays
 	# Build clustered output frame
 	centroids = pl.DataFrame(rows).sort('gbif_id')
 	# Compute elapsed seconds for logs
@@ -881,30 +970,77 @@ def package_data_from_parquet(release: dict, habitat_path: str, centroids_path: 
 			part_path = os.path.join(parts_dir, f"part_{part:02d}.parquet").replace('\\', '/')
 			# Track current partition path for final merge
 			part_paths.append(part_path)
-			# Build one partition of geo payload with the same variant-A semantics
+			# Load partition habitat rows into mutable working table for iterative tail coarsening
+			db.execute(f"""
+				CREATE OR REPLACE TEMP TABLE habitat_work AS
+				SELECT gbif_id, tile_id, center_lng, center_lat, count
+				FROM read_parquet('{habitat_path_sql}')
+				WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part};
+			""")
+			# Iteratively coarsen only tail rows until heavy taxa are near target tile budget
+			for _ in range(HABITAT_COARSEN_MAX_ITER):
+				# Build current heavy-taxon config from mutable work table
+				db.execute(f"""
+					CREATE OR REPLACE TEMP TABLE habitat_cfg AS
+					WITH habitat_stats AS (
+						SELECT
+							gbif_id,
+							COUNT(*) AS tile_count,
+							SUM(CASE WHEN count >= {HABITAT_GUARD_OCC_THRESHOLD} THEN 1 ELSE 0 END) AS locked_tiles,
+							SUM(CASE WHEN count < {HABITAT_GUARD_OCC_THRESHOLD} THEN 1 ELSE 0 END) AS tail_tiles
+						FROM habitat_work
+						GROUP BY gbif_id
+					)
+					SELECT gbif_id
+					FROM habitat_stats
+					WHERE tile_count > {HABITAT_TARGET_TILES}
+					AND tail_tiles > 0;
+				""")
+				# Stop iterations once no heavy taxa remain in this partition
+				heavy_rows = db.execute("SELECT COUNT(*) FROM habitat_cfg").fetchone()[0]
+				if not heavy_rows: break
+				# Rebuild habitat_work: keep non-heavy and locked rows, coarsen only heavy tail rows one step
+				db.execute(f"""
+					CREATE OR REPLACE TEMP TABLE habitat_next AS
+					WITH habitat_non_heavy AS (
+						SELECT h.gbif_id, h.tile_id, h.center_lng, h.center_lat, h.count
+						FROM habitat_work h
+						LEFT JOIN habitat_cfg c ON h.gbif_id = c.gbif_id
+						WHERE c.gbif_id IS NULL
+					),
+					habitat_heavy_locked AS (
+						SELECT h.gbif_id, h.tile_id, h.center_lng, h.center_lat, h.count
+						FROM habitat_work h
+						JOIN habitat_cfg c ON h.gbif_id = c.gbif_id
+						WHERE h.count >= {HABITAT_GUARD_OCC_THRESHOLD}
+					),
+					habitat_heavy_tail AS (
+						SELECT
+							h.gbif_id,
+							CAST(floor(floor(h.tile_id / {TILE_COUNT}) / 2.0) * {TILE_COUNT} + floor((h.tile_id % {TILE_COUNT}) / 2.0) AS UINTEGER) AS tile_id,
+							sum(h.center_lng * h.count) / sum(h.count) AS center_lng,
+							sum(h.center_lat * h.count) / sum(h.count) AS center_lat,
+							sum(h.count) AS count
+						FROM habitat_work h
+						JOIN habitat_cfg c ON h.gbif_id = c.gbif_id
+						WHERE h.count < {HABITAT_GUARD_OCC_THRESHOLD}
+						GROUP BY 1,2
+					)
+					SELECT * FROM habitat_non_heavy
+					UNION ALL
+					SELECT * FROM habitat_heavy_locked
+					UNION ALL
+					SELECT * FROM habitat_heavy_tail;
+				""")
+				# Swap iterative habitat table to next state
+				db.execute("CREATE OR REPLACE TEMP TABLE habitat_work AS SELECT * FROM habitat_next")
+			# Build one partition of geo payload from iteratively normalized habitat_work
 			db.execute(f"""
 				COPY (
-					-- Load this hash partition of habitat rows from staged parquet.
-					WITH habitat_raw AS (SELECT gbif_id, tile_id, center_lng, center_lat, count FROM read_parquet('{habitat_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}),
-					-- Count tile cardinality per taxon to identify heavy maps.
-					habitat_counts AS (SELECT gbif_id, COUNT(*) AS tile_count FROM habitat_raw GROUP BY gbif_id),
-					-- Compute adaptive coarsening shift for taxa above display cap.
-					habitat_cfg AS (SELECT gbif_id, CAST(greatest(1, ceil(ln(tile_count::DOUBLE / {HABITAT_DISPLAY_CAP}::DOUBLE) / ln(4.0))) AS INTEGER) AS shift FROM habitat_counts WHERE tile_count > {HABITAT_DISPLAY_CAP}),
-					-- Keep non-heavy taxa unchanged at native tile resolution.
-					habitat_non_heavy AS (SELECT h.gbif_id, h.tile_id, h.center_lng, h.center_lat, h.count FROM habitat_raw h LEFT JOIN habitat_cfg c ON h.gbif_id = c.gbif_id WHERE c.gbif_id IS NULL),
-					-- Coarsen heavy taxa and preserve weighted centers plus occurrence mass.
-					habitat_heavy_coarse AS (SELECT h.gbif_id, CAST(floor(floor(h.tile_id / {TILE_COUNT}) / pow(2, c.shift)) * {TILE_COUNT} + floor((h.tile_id % {TILE_COUNT}) / pow(2, c.shift)) AS UINTEGER) AS tile_id, sum(h.center_lng * h.count) / sum(h.count) AS center_lng, sum(h.center_lat * h.count) / sum(h.count) AS center_lat, sum(h.count) AS count FROM habitat_raw h JOIN habitat_cfg c ON h.gbif_id = c.gbif_id GROUP BY 1,2),
-					-- Recombine unchanged and coarsened rows before JSON packing.
-					habitat_normalized AS (SELECT * FROM habitat_non_heavy UNION ALL SELECT * FROM habitat_heavy_coarse),
-					-- Pack habitat JSON with dense-first ordering for map rendering.
-					habitat_part AS (SELECT gbif_id, array_agg(struct_pack(lng := center_lng, lat := center_lat, occ := count) ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC)::JSON AS habitat, max(count) AS max, avg(count) AS avg FROM habitat_normalized GROUP BY gbif_id),
-					-- Normalize and dedupe centroid pairs to legacy DECIMAL precision per partition.
+					WITH habitat_part AS (SELECT gbif_id, array_agg(struct_pack(lng := center_lng, lat := center_lat, occ := count) ORDER BY CASE WHEN count < 20 THEN 1 ELSE 0 END, count DESC)::JSON AS habitat, max(count) AS max, avg(count) AS avg FROM habitat_work GROUP BY gbif_id),
 					centroid_clean AS (SELECT gbif_id, list_distinct(list_transform(centroids, coord -> [coord[1]::DECIMAL(8,4), coord[2]::DECIMAL(8,4)]))::JSON AS centroids FROM read_parquet('{centroids_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part}),
-					-- Pack elevation profile bins into stable elevation-sorted JSON arrays.
 					elevation_profile_clean AS (SELECT gbif_id, array_agg(struct_pack(elevation := elevation_bin, occ := bin_count) ORDER BY elevation_bin)::JSON AS elevation_profile FROM read_parquet('{elevation_bins_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part} GROUP BY gbif_id),
-					-- Cast elevation medians into final storage type for this partition.
 					elevation_medians_clean AS (SELECT gbif_id, cast(elevation AS SMALLINT) AS elevation FROM read_parquet('{elevation_medians_path_sql}') WHERE abs(hash(gbif_id)) % {PACKAGE_PARTITIONS} = {part})
-					-- Join packaged habitat rows with normalized centroids and elevation payloads.
 					SELECT h.gbif_id, h.habitat, h.max, h.avg, c.centroids, m.elevation, ep.elevation_profile
 					FROM habitat_part h
 					LEFT JOIN centroid_clean c ON h.gbif_id = c.gbif_id
