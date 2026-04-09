@@ -1,8 +1,8 @@
 # Keep download-related helpers centralized for all dataset handlers
 
-# Load async HTTP client, async file writes, SSL, filesystem, and regex helpers
+# Load async HTTP client, async file writes, filesystem, and regex helpers
 from .log import mesologger
-import aiohttp, aiofiles, ssl, os, re
+import aiohttp, aiofiles, os, re
 # Load datetime parsing for Last-Modified headers
 from datetime import datetime
 # Load URL/path suffix extraction helpers
@@ -103,8 +103,8 @@ async def download_file(session: aiohttp.ClientSession, source: dict) -> int | N
 		# Use aiohttp direct download path for non-aria sources
 		else:
 			# Start HTTP GET request with permissive SSL context matching existing behavior
-			# Execute request with TLS defaults
-			async with session.get(url, ssl=ssl.create_default_context()) as response:
+			# Execute request with permissive TLS verification for source compatibility
+			async with session.get(url, ssl=False) as response:
 				# Open destination file in binary write mode
 				async with aiofiles.open(target_path, mode='wb') as file:
 					# Log download start details
@@ -295,11 +295,11 @@ async def get_timestamp_remote(source: dict) -> int:
 	# Use a dedicated short-lived session for timestamp checks
 	async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
 		# Try HEAD request first for cheapest metadata lookup
-		response = await session.head(source['url'], ssl=ssl.create_default_context(), allow_redirects=True)
+		response = await session.head(source['url'], ssl=False, allow_redirects=True)
 		# Return parsed datehash when HEAD succeeded
 		if response.status == 200: return get_datehash_from_response(response)
 		# Fallback to tiny ranged GET for hosts that reject HEAD
-		response = await session.get(source['url'], ssl=ssl.create_default_context(), allow_redirects=True, headers={'Range': 'bytes=0-0'})
+		response = await session.get(source['url'], ssl=False, allow_redirects=True, headers={'Range': 'bytes=0-0'})
 		# Close body immediately so payload is not downloaded fully
 		response.close()
 		# Return parsed datehash when fallback returned content headers

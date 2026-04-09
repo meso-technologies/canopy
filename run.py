@@ -55,6 +55,10 @@ async def main(argv=None):
 	runtime = build_settings(args)
 	# Mark pure download mode so dataset handlers skip processing work
 	runtime.DOWNLOAD_ONLY = bool(args.download and not args.process)
+	# Detect default no-flag canopy run and explicit stage-selection runs
+	run_full_default = not any([args.download, args.process, args.fuse, args.geo, args.apis, args.litmus])
+	# Disable remote download checks for explicit stage runs unless download stage is requested
+	runtime.CHECK_FOR_DOWNLOADS = bool(args.download) if not run_full_default else runtime.CHECK_FOR_DOWNLOADS
 	# Publish runtime settings globally for canopy modules
 	settings.set_config(runtime)
 	# Announce canopy start for long-running logs
@@ -74,8 +78,6 @@ async def main(argv=None):
 		had_errors = False
 		# Collect per-source processing metadata for downstream fusion/diff
 		results = {}
-		# Detect default no-flag canopy run and execute full pipeline in that mode
-		run_full_default = not any([args.download, args.process, args.fuse, args.geo, args.apis, args.litmus])
 		# Run source stage when explicitly requested, during download-only mode, or in full default flow
 		run_processing = args.process or args.download or run_full_default
 		# Start dataset execution stage when requested

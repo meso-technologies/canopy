@@ -5,8 +5,6 @@ import asyncio
 import json
 # Load filesystem helpers for local storage backend and temp downloads
 import os
-# Load SSL context for parity with existing downloader behavior
-import ssl
 # Load timing helpers for periodic multipart progress logging
 import time
 # Load canopy paths and settings proxy
@@ -495,7 +493,7 @@ class S3Storage:
 		# Probe remote headers before starting multipart upload
 		try:
 			# Request response headers for content length and range support
-			async with session.head(url, ssl=ssl.create_default_context()) as head_response:
+			async with session.head(url, ssl=False) as head_response:
 				# Raise when HEAD request failed
 				head_response.raise_for_status()
 				# Parse remote content length for fixed range partitioning
@@ -565,7 +563,7 @@ class S3Storage:
 					had_503 = False
 					try:
 						# Fetch one ranged payload segment from upstream source
-						async with session.get(url, headers=range_header, ssl=ssl.create_default_context()) as response:
+						async with session.get(url, headers=range_header, ssl=False) as response:
 							# Flag transient upstream throttling for targeted backoff and fallback
 							if response.status == 503:
 								had_503 = True
@@ -612,7 +610,7 @@ class S3Storage:
 							# Log fallback path for operator visibility
 							mesologger.warning(f"Falling back to single-range fetch for part {part_number} after repeated 503 responses")
 							# Fetch this exact range without worker competition and upload once
-							async with session.get(url, headers=range_header, ssl=ssl.create_default_context()) as response:
+							async with session.get(url, headers=range_header, ssl=False) as response:
 								# Raise when fallback response is still not usable
 								if response.status not in [200, 206]: raise RuntimeError(f'Fallback range status {response.status} for part {part_number}')
 								# Read fallback payload bytes
@@ -700,7 +698,7 @@ class S3Storage:
 		upload_id = create['UploadId']
 		try:
 			# Open streaming HTTP request for source payload
-			async with session.get(url, ssl=ssl.create_default_context()) as response:
+			async with session.get(url, ssl=False) as response:
 				# Raise for HTTP failures before uploading parts
 				response.raise_for_status()
 				# Log start of streamed multipart upload
