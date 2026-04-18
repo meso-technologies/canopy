@@ -45,6 +45,10 @@ async def main(argv=None):
 	parser.add_argument('--apis', action='store_true', help='Update API-backed enrichment datasets like Wikipedia abstracts')
 	# Execute litmus validation stage against packaged release artifacts
 	parser.add_argument('--litmus', action='store_true', help='Run litmus checks against release parquet and write summary to manifest')
+	# Execute diff stage that compares current release against previous or explicit baseline
+	parser.add_argument('--diff', action='store_true', help='Compute per-source diff against previous release or explicit baseline')
+	# Override diff baseline with an explicit release version for admin comparisons against current_published
+	parser.add_argument('--diff-against', dest='diff_against', metavar='VERSION', help='Diff against this specific release version instead of most recent predecessor')
 	# Enable S3-compatible storage backend for canopy data paths
 	parser.add_argument('--s3', action='store_true', help='Use configured S3 storage backend instead of local storage')
 	# Parse CLI args (or injected argv from wrapper)
@@ -56,7 +60,7 @@ async def main(argv=None):
 	# Mark pure download mode so dataset handlers skip processing work
 	runtime.DOWNLOAD_ONLY = bool(args.download and not args.process)
 	# Detect default no-flag canopy run and explicit stage-selection runs
-	run_full_default = not any([args.download, args.process, args.fuse, args.geo, args.apis, args.litmus])
+	run_full_default = not any([args.download, args.process, args.fuse, args.geo, args.apis, args.litmus, args.diff])
 	# Disable remote download checks for explicit stage runs unless download stage is requested
 	runtime.CHECK_FOR_DOWNLOADS = bool(args.download) if not run_full_default else runtime.CHECK_FOR_DOWNLOADS
 	# Publish runtime settings globally for canopy modules
@@ -215,6 +219,20 @@ async def main(argv=None):
 				# Emit concise error summary for quick scanning.
 				mesologger.error(f'Error during litmus: {type(e).__name__}: {str(e)}')
 				# Emit full traceback for debugging.
+				traceback.print_exception(type(e), e, e.__traceback__)
+		# Run diff when explicitly requested or during full default flow
+		if args.diff or run_full_default:
+			try:
+				# Import diff runner lazily to keep startup costs low
+				from .pipeline.diff import run as run_diff
+				# Execute diff against current release, honoring --diff-against override when provided
+				run_diff(release, diff_against=args.diff_against)
+			except Exception as e:
+				# Mark diff failure so process exits non-zero
+				had_errors = True
+				# Emit concise error summary for quick scanning
+				mesologger.error(f'Error during diff: {type(e).__name__}: {str(e)}')
+				# Emit full traceback for debugging
 				traceback.print_exception(type(e), e, e.__traceback__)
 		# Abort with non-zero exit semantics when any stage failed
 		if had_errors:

@@ -12,7 +12,7 @@ from ..utils.s3 import storage
 from ..utils.state import update_source_state
 
 # Track distilled release artifact prefixes for cleanup logic
-releasefiles = ['precog','typesense','postgres','taxonext','citations','timeline','rarities']
+releasefiles = ['precog','typesense','postgres','taxonext','citations','timeline','rarities','diff']
 
 # Fetch source metadata, optionally download updates, and decide whether processing is needed
 async def fetch(session, source: dict) -> bool:
@@ -140,33 +140,74 @@ def check_release(release,dir=None):
 	# Return true when release manifest exists in active storage backend
 	return storage.exists(release_path)
 
+# Match valid release folder naming (YYYYMMDD-hash), shared across release lookup helpers
+_release_pattern = None
+
+# Return compiled release folder regex once per process
+def _get_release_pattern():
+	# Cache compiled regex to avoid re-parsing per call
+	global _release_pattern
+	# Build pattern on first access
+	if _release_pattern is None:
+		import re
+		_release_pattern = re.compile(r'^\d{8}-[a-f0-9]+$')
+	# Return compiled pattern for shared use
+	return _release_pattern
+
+# List valid release folder names in the given dir sorted newest-last for lex-based ordering
+def _list_releases(release_dir=None):
+	# Default to canopy releases dir
+	if not release_dir: release_dir = RELEASES_DIR
+	# Filter directory entries to valid release folder names only
+	pattern = _get_release_pattern()
+	# Return sorted list so callers can pick max or predecessor by index
+	return sorted([entry for entry in storage.list_dirs(release_dir) if pattern.match(entry)])
+
+# Load manifest dict for one specific release version, or None when absent/corrupted
+def get_release(version, release_dir=None):
+	import json
+	# Abort early on missing version input
+	if not version: return None
+	# Default to canopy releases dir
+	if not release_dir: release_dir = RELEASES_DIR
+	# Build canonical manifest path for the requested version
+	manifest_path = os.path.join(release_dir, version, 'manifest.json')
+	# Return None when manifest does not exist in active storage backend
+	if not storage.exists(manifest_path):
+		mesologger.info(f"No release manifest found for {version} in {release_dir}")
+		return None
+	# Try reading and parsing the manifest file
+	try: return storage.read_json(manifest_path)
+	# Log missing manifest path as an error for visibility
+	except FileNotFoundError: mesologger.error(f"No manifest found in {version}")
+	# Log corrupted manifest so operators can investigate storage
+	except json.JSONDecodeError: mesologger.error(f"{version} release manifest corrupted")
+	# Explicit None when any read error occurred
+	return None
+
 # Load latest release manifest based on YYYYMMDD-hash release folder naming
 def get_latest_release(release_dir=None):
-	import re, json
-	newest_release = None
-	newest_date = None
-	# Default to staging dir
-	if not release_dir: release_dir = RELEASES_DIR
-	# Go through release directories from active storage backend
-	for entry in storage.list_dirs(release_dir):	
-		# Check if it's a proper release
-		if re.match(r'^\d{8}-[a-f0-9]+$', entry):
-			# Extract date part
-			date_str = entry.split('-')[0]
-			# If this is the first valid directory or newer than our current newest
-			if newest_date is None or date_str > newest_date:
-				newest_date = date_str
-				newest_release = entry
-	# If we still don't have a release
-	if not newest_release:
-		mesologger.info(f"No release found in {release_dir}")		
-		return	
-	# Try fetching manifest
-	try: 
-		return storage.read_json(os.path.join(release_dir, newest_release, 'manifest.json'))
-	# Error logging
-	except FileNotFoundError: mesologger.error(f"No manifest found in { newest_release }")
-	except json.JSONDecodeError: mesologger.error(f"{ newest_release } release manifest corrupted")	
+	# List valid release folders sorted ascending so lex-max is last
+	releases = _list_releases(release_dir)
+	# Log and return nothing when no valid releases exist
+	if not releases:
+		mesologger.info(f"No release found in {release_dir or RELEASES_DIR}")
+		return None
+	# Delegate manifest loading to shared primitive
+	return get_release(releases[-1], release_dir)
+
+# Load manifest of the release immediately preceding current_version by lex sort
+def get_previous_release(current_version, release_dir=None):
+	# Abort early on missing current version input
+	if not current_version: return None
+	# List valid release folders sorted ascending
+	releases = _list_releases(release_dir)
+	# Keep only releases strictly older than current by lex sort
+	older = [entry for entry in releases if entry < current_version]
+	# Return None when no predecessor exists so callers can emit all-new diff
+	if not older: return None
+	# Delegate manifest loading to shared primitive using most recent predecessor
+	return get_release(older[-1], release_dir)
 
 # Remove stale hashed release artifacts that are no longer referenced by manifest
 def cleanup_release(dir, manifest):
