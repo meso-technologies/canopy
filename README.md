@@ -30,6 +30,9 @@ uv run python -m importer.canopy.run --debug --process --fuse
 - `--fuse` — build fused release output
 - `--geo` — compute geospatial artifact
 - `--apis` — run API-backed enrichment (Wikipedia abstracts etc)
+- `--litmus` — run validation checks against packaged release
+- `--diff` — compute per-source new/changed/deleted counts against previous release
+- `--diff-against VERSION` — override diff baseline with an explicit release version
 - `--s3` — use S3 storage backend (needs creds in `config/secrets.py`)
 
 ## Environment Variables
@@ -39,4 +42,4 @@ uv run python -m importer.canopy.run --debug --process --fuse
 
 ## Setup & Secrets
 
-Run `./setup.sh` once and `./update.sh` occasionally. Copy `config/secrets.py.template` to `config/secrets.py` and fill credentials before running. Missing credentials are handled gracefully (GBIF updates are skipped, S3 mode disabled).
+Run `./setup.sh` once and `./update.sh` occasionally. Copy `config/secrets.py.template` to `config/secrets.py` and fill credentials before running. Missing credentials are handled gracefully (GBIF & Wikipedia abstract updates are skipped, S3 mode disabled).
