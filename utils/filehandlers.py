@@ -75,6 +75,8 @@ def get_latest_processed() -> dict | None:
 		if not name in datasets: datasets.append(name)
 	# Go through dataset
 	for dataset in datasets:
+		# Skip pipeline outputs before the sources insert below or they leak into the manifest
+		if dataset in ['geo']: continue
 		item = get_file(dataset)
 		# Append it to dict
 		if item: sources[dataset] = { 
@@ -82,8 +84,6 @@ def get_latest_processed() -> dict | None:
 			'latest_processed': item, 
 			'timestamp_processed': item.split('.')[1]
 		}
-		# Skip pipeline outputs that live in processed dir but aren't source datasets
-		if dataset in ['geo']: continue
 		# Import dataset module to get citation metadata for release manifest
 		module = importlib.import_module(f"importer.canopy.datasets.{dataset}")
 		if module: 

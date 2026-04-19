@@ -1164,6 +1164,27 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 	# Add missing GBIF / NCBI IDs by name
 	# Those two are essentials we derive obeservations and thus climate from GBIF, and all protein lookups from NCBI
 	for source in ['gbif','ncbi']:
+		# NCBI-specific: redirect obsolete taxids via the authoritative merged.dmp mapping before nulling anything.
+		# This preserves cross-source ID links (most commonly from Wikidata) across NCBI's historical merges,
+		# including cases where the merged-away taxid carried a different scientific name and name-match
+		# fallback would silently lose the link.
+		if source == 'ncbi':
+			# merged_from is stored as UINTEGER[] on the ncbi parquet because the relationship is
+			# naturally one-to-many (many old taxids redirect into one current taxid). Joining
+			# directly against list_contains would force a nested loop since there is no scalar
+			# equi-join predicate. Unnest in a pipelined CTE so DuckDB can hash-join on equality;
+			# measured end-to-end cost drops from ~150s to well under a second at current volumes.
+			result = db.execute("""
+				WITH ncbi_redirects AS (
+					SELECT unnest(merged_from) AS old_id, id_raw AS new_id
+					FROM ncbi WHERE merged_from IS NOT NULL
+				)
+				UPDATE meso m SET ncbi_id = r.new_id
+				FROM ncbi_redirects r
+				WHERE m.accepted AND m.ncbi_id IS NOT NULL AND m.ncbi_id = r.old_id
+				RETURNING 1;
+			""").fetchall()
+			mesologger.info(f"Redirected {len(result):,} obsolete NCBI IDs via merged.dmp")
 		# Null all ids that are not in the source datasets anymore
 		result = db.execute(f"""
 			UPDATE meso SET {source}_id = NULL

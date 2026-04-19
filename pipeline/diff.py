@@ -41,8 +41,8 @@ CHANGE_COLS = {
 	'mycobank':    ['name_clean','rank_clean','author_raw','year'],
 	# Cross-kingdom backbone with publication year
 	'gbif':        ['name_clean','rank_clean','author_raw','year'],
-	# NCBI has no publication year in processed parquet
-	'ncbi':        ['name_clean','rank_clean'],
+	# NCBI carries author from the names.dmp authority rows but no publication year
+	'ncbi':        ['name_clean','rank_clean','author_raw'],
 	# Specimen registry has no rank column but tracks year
 	'tropicos':    ['name_clean','author_raw','year'],
 	# IUCN conservation status flips are the key signal alongside basic name/rank drift (no year column)
