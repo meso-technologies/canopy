@@ -20,37 +20,41 @@ from ..utils.s3 import storage
 # Load release resolution helpers shared with other stages
 from ..utils.filehandlers import get_latest_release, get_previous_release, get_release
 
-# Acceptance authorities publish taxonomic acceptance flags we scope diffs against
-ACCEPTANCE = {'powo','wcvp','wfo','col','gbif','iucn','inaturalist'}
-# Registries publish names or cross-references without taxonomic acceptance semantics
-REGISTRY   = {'ipni','tropicos','fungorum','mycobank','ncbi','wikidata'}
 # Bibliographic enrichment source has non-unique id_raw so diff is meaningless there
-EXCLUDED   = {'bhl'}
+EXCLUDED = {'bhl'}
 
-# Tracked content columns per source drive the "changed" detection
-# Year changes are tracked where available since they represent real upstream metadata improvements
-CHANGE_COLS = {
+# Keep one profile map for source-level diff semantics and tracked changed fields
+DIFF_PROFILES = {
 	# Core plant backbones with author, rank and publication year
-	'powo':        ['name_clean','rank_clean','author_raw','year'],
-	'wcvp':        ['name_clean','rank_clean','author_raw','year'],
-	'wfo':         ['name_clean','rank_clean','author_raw','year'],
-	'col':         ['name_clean','rank_clean','author_raw','year'],
+	'powo':        {'kind': 'authority', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	'wcvp':        {'kind': 'authority', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	'wfo':         {'kind': 'authority', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	'col':         {'kind': 'authority', 'cols': ['name_clean','rank_clean','author_raw','year']},
 	# Registries with author, rank and publication year
-	'ipni':        ['name_clean','rank_clean','author_raw','year'],
-	'fungorum':    ['name_clean','rank_clean','author_raw','year'],
-	'mycobank':    ['name_clean','rank_clean','author_raw','year'],
+	'ipni':        {'kind': 'registry', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	'fungorum':    {'kind': 'registry', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	'mycobank':    {'kind': 'registry', 'cols': ['name_clean','rank_clean','author_raw','year']},
 	# Cross-kingdom backbone with publication year
-	'gbif':        ['name_clean','rank_clean','author_raw','year'],
-	# NCBI carries author from the names.dmp authority rows but no publication year
-	'ncbi':        ['name_clean','rank_clean','author_raw'],
-	# Specimen registry has no rank column but tracks year
-	'tropicos':    ['name_clean','author_raw','year'],
-	# IUCN conservation status flips are the key signal alongside basic name/rank drift (no year column)
-	'iucn':        ['name_clean','rank_clean','author_raw','iucn_status'],
-	# iNat carries acceptance and rank only (no year column)
-	'inaturalist': ['name_clean','rank_clean'],
+	'gbif':        {'kind': 'authority', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	# NCBI currently carries author but no publication year
+	'ncbi':        {'kind': 'registry', 'cols': ['name_clean','rank_clean','author_raw']},
+	# Tropicos now carries rank_clean in processed output
+	'tropicos':    {'kind': 'registry', 'cols': ['name_clean','rank_clean','author_raw','year']},
+	# IUCN conservation status flips are high-signal change events
+	'iucn':        {'kind': 'authority', 'cols': ['name_clean','rank_clean','author_raw','iucn_status']},
+	# iNat carries authority + cleaned names/ranks only (no year)
+	'inaturalist': {'kind': 'authority', 'cols': ['name_clean','rank_clean']},
 	# Wikidata tracks cross-reference flips, flags and publication year
-	'wikidata':    ['name_clean','rank_clean','year','ipni_id','powo_id','wfo_id','col_id','gbif_id','ncbi_id','iucn_id','edible','toxic','medicinal'],
+	'wikidata':    {'kind': 'registry', 'cols': ['name_clean','rank_clean','year','ipni_id','powo_id','wfo_id','col_id','gbif_id','ncbi_id','iucn_id','edible','toxic','medicinal']},
+}
+
+# Keep one explicit profile for fused meso accepted-taxa diff reporting
+MESO_DIFF_PROFILE = {
+	'kind': 'authority',
+	'id_col': 'id_meso',
+	'name_col': 'name',
+	'rank_col': 'rank',
+	'cols': ['name', 'rank', 'author', 'year', 'parent_consensus', 'iucn_status'],
 }
 
 # Cap sample entry count per category to keep sidecar lean even on wide churn
@@ -90,8 +94,12 @@ def run(release=None, diff_against=None):
 		for name, source in manifest.get('sources', {}).items():
 			# Skip bibliographic source since its id_raw is non-unique
 			if name in EXCLUDED: continue
-			# Classify the source so diff kind and scope expression can be chosen
-			kind = 'acceptance' if name in ACCEPTANCE else 'registry'
+			# Resolve explicit profile for source-level diff semantics
+			profile = DIFF_PROFILES.get(name)
+			# Skip unknown sources explicitly so new feeds require profile declaration
+			if not profile:
+				mesologger.info(f"[diff] {name} skipped no_diff_profile")
+				continue
 			# Resolve current parquet path from manifest
 			cur_parquet = source.get('latest_processed')
 			# Skip sources without a processed artifact so we do not invent diffs
@@ -102,14 +110,25 @@ def run(release=None, diff_against=None):
 			cur_path = os.path.join(release_dir, cur_parquet)
 			# Resolve previous parquet path from baseline manifest when it exists
 			prev_parquet, prev_path = _resolve_prev_parquet(previous, name)
-			# Build per-source diff block and sidecar entries
-			diff_block, sidecar = _diff_one_source(db, name, kind, cur_path, cur_parquet, prev_path, prev_parquet)
+			# Build per-source diff block and sidecar entries through one shared profile path
+			diff_block, sidecar = _diff_profile(db, profile, cur_path, cur_parquet, prev_path, prev_parquet)
 			# Attach scalar diff block to source entry in manifest
 			source['diff'] = diff_block
 			# Preserve per-source sample arrays for combined sidecar write
 			sidecar_sources[name] = sidecar
 			# Emit grep-friendly summary log for operator triage
 			_log_source_summary(name, diff_block)
+		# Resolve current and previous fused meso parquet paths for dataset-level diff
+		cur_meso_parquet = f"{version}.parquet"
+		cur_meso_path = os.path.join(release_dir, cur_meso_parquet)
+		prev_version = previous.get('version') if previous else None
+		prev_meso_parquet = f"{prev_version}.parquet" if prev_version else None
+		prev_meso_path = os.path.join(RELEASES_DIR, prev_version, prev_meso_parquet) if prev_version else None
+		# Build meso accepted-scope diff and append it into sidecar sources
+		meso_block, meso_sidecar = _diff_profile(db, MESO_DIFF_PROFILE, cur_meso_path, cur_meso_parquet, prev_meso_path, prev_meso_parquet)
+		sidecar_sources['meso'] = meso_sidecar
+		# Emit grep-friendly summary log for meso-level dataset diff
+		_log_source_summary('meso', meso_block)
 		# Build combined sidecar payload with versioning metadata for consumers
 		sidecar_payload = {
 			'schema': 1,
@@ -122,11 +141,12 @@ def run(release=None, diff_against=None):
 		# Write combined sidecar into canopy release dir for distill pickup
 		storage.write_json(os.path.join(release_dir, sidecar_name), sidecar_payload)
 		mesologger.info(f"Wrote diff sidecar {sidecar_name}")
-	# Inject top-level diff filename so build_detail surfaces it automatically via summary.artifacts
-	manifest['diff'] = sidecar_name
+	# Inject top-level meso diff summary and sidecar pointer
+	meso_block['sidecar'] = sidecar_name
+	manifest['diff'] = meso_block
 	# Write manifest back with injected diff blocks and filename
 	storage.write_json(manifest_path, manifest)
-	mesologger.info(f"Updated {manifest_path} with per-source diff blocks")
+	mesologger.info(f"Updated {manifest_path} with per-source diff blocks and meso diff summary")
 
 # Resolve baseline release honoring explicit override with graceful fallback to on-disk previous
 def _resolve_baseline(current_version, diff_against):
@@ -156,14 +176,22 @@ def _resolve_prev_parquet(previous, name):
 	# Return both filename and absolute path for diff query consumption
 	return prev_parquet, prev_path
 
-# Dispatch one source to first-release, unchanged-file, or full-diff code paths
-def _diff_one_source(db, name, kind, cur_path, cur_parquet, prev_path, prev_parquet):
-	# First-release path when no baseline or baseline lacks this source
-	if not prev_path: return _diff_first_release(db, name, kind, cur_path)
+# Dispatch one configured profile to first-release, unchanged-file, or full-diff code paths
+def _diff_profile(db, profile, cur_path, cur_parquet, prev_path, prev_parquet):
+	# Resolve kind from profile (authority or registry)
+	kind = profile['kind']
+	# Resolve optional id/name/rank overrides with source defaults
+	id_col = profile.get('id_col', 'id_raw')
+	name_col = profile.get('name_col', 'name_clean')
+	rank_col = profile.get('rank_col', 'rank_clean')
+	# Resolve tracked column list from profile
+	cols = profile.get('cols', [])
+	# First-release path when no baseline or predecessor parquet is missing
+	if not prev_path or not storage.exists(prev_path): return _diff_first_release(db, kind, cur_path, id_col=id_col, name_col=name_col, rank_col=rank_col)
 	# Unchanged-file shortcut when baseline and current processed artifact filenames match
 	if cur_parquet == prev_parquet: return _diff_unchanged(kind, prev_parquet)
 	# Full diff path runs parametric FOJ query across both parquets
-	return _diff_full(db, name, kind, cur_path, prev_path, prev_parquet)
+	return _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col=id_col, name_col=name_col, rank_col=rank_col, cols=cols)
 
 # Emit zero-counts block when source parquet is identical between releases
 def _diff_unchanged(kind, prev_parquet):
@@ -182,10 +210,10 @@ def _diff_unchanged(kind, prev_parquet):
 	# Return tuple matching the _diff_full contract
 	return diff_block, sidecar
 
-# Emit all-new diff when no baseline release exists for this source
-def _diff_first_release(db, name, kind, cur_path):
+# Emit all-new diff when no baseline release exists for this profile
+def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clean', rank_col='rank_clean'):
 	# Build scope expression for first-release counting under the source's kind
-	scope_expr = 'accepted' if kind == 'acceptance' else 'TRUE'
+	scope_expr = 'accepted' if kind == 'authority' else 'TRUE'
 	# Count accepted/present rows in current parquet for scope metadata
 	cur_count = db.execute(f"""
 		SELECT COUNT(*) FROM read_parquet($cur) WHERE COALESCE({scope_expr}, FALSE)
@@ -193,7 +221,7 @@ def _diff_first_release(db, name, kind, cur_path):
 	# Respect sample cap so a 1.78M-row first IPNI release does not produce a 140 MB sidecar
 	cap = SAMPLE_CAP
 	# Collect capped sample entries mirroring the full-diff entry shape
-	samples = _collect_first_release_samples(db, name, kind, cur_path, cap)
+	samples = _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col=id_col, name_col=name_col, rank_col=rank_col)
 	# Flag truncation when current scope exceeds sample cap
 	truncated = cur_count > cap
 	# Build scalar block with first-release semantics
@@ -210,51 +238,55 @@ def _diff_first_release(db, name, kind, cur_path):
 	# Return tuple matching the _diff_full contract
 	return diff_block, sidecar
 
-# Run the parametric full-outer-join diff query for one source
-def _diff_full(db, name, kind, cur_path, prev_path, prev_parquet):
+# Run the parametric full-outer-join diff query for one profile
+def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', cols=None):
 	# Resolve scope expression once so it participates in both CTEs and samples
-	scope_expr = 'accepted' if kind == 'acceptance' else 'TRUE'
-	# Get tracked content columns for this source
-	cols = CHANGE_COLS[name]
-	# Build optional rank selector since tropicos lacks rank_clean entirely
-	rank_select = 'rank_clean' if 'rank_clean' in cols else "NULL::VARCHAR AS rank_clean"
+	scope_expr = 'accepted' if kind == 'authority' else 'TRUE'
+	# Resolve tracked content columns from explicit profile list
+	tracked_cols = cols if cols is not None else []
+	# Keep only tracked columns that exist on both current and previous parquets
+	tracked_cols = _common_columns(db, cur_path, prev_path, tracked_cols)
+	# Build id/name/rank projections with type-safe string coercion
+	id_expr = f"{id_col}::VARCHAR"
+	name_expr = f"{name_col}" if _column_exists(db, cur_path, name_col) and _column_exists(db, prev_path, name_col) else 'NULL::VARCHAR'
+	rank_expr = f"{rank_col}" if _column_exists(db, cur_path, rank_col) and _column_exists(db, prev_path, rank_col) else 'NULL::VARCHAR'
 	# Build per-column DISTINCT FROM expressions for "changed" detection
-	distinct_exprs = [f"c.{col} IS DISTINCT FROM p.{col}" for col in cols]
+	distinct_exprs = [f"c.{col} IS DISTINCT FROM p.{col}" for col in tracked_cols]
 	# Combine DISTINCT FROM expressions into one OR chain
 	changed_expr = ' OR '.join(distinct_exprs) if distinct_exprs else 'FALSE'
 	# Build per-column fields array expressions for the sidecar changed entries
 	field_cases = []
 	# One CASE per tracked column to populate the fields list conditionally
-	for col in cols:
+	for col in tracked_cols:
 		field_cases.append(f"CASE WHEN c.{col} IS DISTINCT FROM p.{col} THEN '{col}' END")
 	# Combine into a list-building expression that drops NULLs
 	fields_expr = f"list_filter([{', '.join(field_cases)}], x -> x IS NOT NULL)" if field_cases else "[]"
-	# Project current and previous columns into one joined table for downstream tagging
-	select_cols = ', '.join(cols)
+	# Project tracked columns into one joined table for downstream tagging
+	tracked_select = ', ' + ', '.join(tracked_cols) if tracked_cols else ''
 	# Build the parametric FOJ query that tags each row new/changed/deleted in one pass
 	query = f"""
 		WITH c AS (
-			SELECT id_raw::VARCHAR AS id_raw, COALESCE({scope_expr}, FALSE) AS acc,
-				   name_clean, {rank_select}, {select_cols}
+			SELECT {id_expr} AS id_key, COALESCE({scope_expr}, FALSE) AS acc,
+				   {name_expr} AS name_value, {rank_expr} AS rank_value{tracked_select}
 			FROM read_parquet($cur)
 		),
 		p AS (
-			SELECT id_raw::VARCHAR AS id_raw, COALESCE({scope_expr}, FALSE) AS acc,
-				   name_clean, {rank_select}, {select_cols}
+			SELECT {id_expr} AS id_key, COALESCE({scope_expr}, FALSE) AS acc,
+				   {name_expr} AS name_value, {rank_expr} AS rank_value{tracked_select}
 			FROM read_parquet($prev)
 		),
 		tagged AS (
-			SELECT COALESCE(c.id_raw, p.id_raw) AS id,
+			SELECT COALESCE(c.id_key, p.id_key) AS id,
 				CASE
-					WHEN (p.id_raw IS NULL OR NOT p.acc) AND c.acc       THEN 'new'
-					WHEN p.acc AND (c.id_raw IS NULL OR NOT c.acc)        THEN 'deleted'
+					WHEN (p.id_key IS NULL OR NOT p.acc) AND c.acc       THEN 'new'
+					WHEN p.acc AND (c.id_key IS NULL OR NOT c.acc)        THEN 'deleted'
 					WHEN p.acc AND c.acc AND ({changed_expr})             THEN 'changed'
 				END AS category,
-				COALESCE(c.name_clean, p.name_clean) AS name,
-				COALESCE(c.rank_clean, p.rank_clean) AS rank,
+				COALESCE(c.name_value, p.name_value) AS name,
+				COALESCE(c.rank_value, p.rank_value) AS rank,
 				-- Fields list is only meaningful on changed entries where both sides exist
 				CASE WHEN p.acc AND c.acc AND ({changed_expr}) THEN {fields_expr} ELSE [] END AS diff_fields
-			FROM c FULL OUTER JOIN p USING (id_raw)
+			FROM c FULL OUTER JOIN p USING (id_key)
 		)
 		SELECT
 			category,
@@ -314,16 +346,30 @@ def _diff_full(db, name, kind, cur_path, prev_path, prev_parquet):
 	# Return both halves of the result for caller assembly
 	return diff_block, sidecar
 
+# Check whether a parquet file contains a specific column name
+
+def _column_exists(db, path, column):
+	# Query DuckDB describe output for one parquet and count matching columns
+	count = db.execute("SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet($path)) d WHERE d.column_name = $column", {'path': path, 'column': column}).fetchone()[0]
+	# Return boolean column existence marker
+	return bool(count)
+
+# Keep only candidate columns that exist on both parquets
+
+def _common_columns(db, cur_path, prev_path, candidates):
+	# Return candidates present on both current and previous release parquets
+	return [col for col in candidates if _column_exists(db, cur_path, col) and _column_exists(db, prev_path, col)]
+
 # Collect capped first-release samples mirroring full-diff entry shape
-def _collect_first_release_samples(db, name, kind, cur_path, cap):
-	# Resolve scope expression so we only sample rows the source considers in-scope
-	scope_expr = 'accepted' if kind == 'acceptance' else 'TRUE'
-	# Tropicos lacks rank_clean so project plain NULL to keep rank projection uniform
-	cols = CHANGE_COLS[name]
-	rank_expr = 'rank_clean' if 'rank_clean' in cols else 'NULL'
-	# Run bounded SELECT with LIMIT to avoid loading 1.78M rows into Python for first IPNI run
+
+def _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col='id_raw', name_col='name_clean', rank_col='rank_clean'):
+	# Build optional rank expression when rank column is absent on the current parquet
+	rank_expr = rank_col if _column_exists(db, cur_path, rank_col) else 'NULL'
+	# Build optional name expression when name column is absent on the current parquet
+	name_expr = name_col if _column_exists(db, cur_path, name_col) else 'NULL'
+	# Run bounded SELECT with LIMIT to avoid loading massive first-release datasets into Python
 	rows = db.execute(f"""
-		SELECT id_raw::VARCHAR AS id, name_clean AS name, {rank_expr} AS rank
+		SELECT {id_col}::VARCHAR AS id, {name_expr} AS name, {rank_expr} AS rank
 		FROM read_parquet($cur)
 		WHERE COALESCE({scope_expr}, FALSE)
 		LIMIT {cap}

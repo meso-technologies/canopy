@@ -8,6 +8,7 @@ from .. import PROCESSED_DIR, SRC_DIR, TMP_DIR, RELEASES_DIR, settings
 from ..utils.downloader import pull, get_local_source_file
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
+from ..utils.manifest import get_diff_sidecar
 # Load run-state helper to persist latest source download/process metadata
 from ..utils.state import update_source_state
 
@@ -220,8 +221,18 @@ def cleanup_release(dir, manifest):
 	# Log
 	mesologger.info(f"Cleaning up release dir {release_dir}")
 	try:
-		# Do list comprehension only once
-		current_files = [manifest[key] for key in releasefiles]
+		# Build referenced artifact filename list once with nested diff.sidecar support
+		current_files = []
+		# Iterate known release artifact keys and collect referenced filenames
+		for key in releasefiles:
+			# Skip missing artifact keys in sparse manifests
+			if key not in manifest: continue
+			# Resolve nested diff sidecar filename through shared manifest helper
+			if key == 'diff':
+				sidecar = get_diff_sidecar(manifest)
+				if isinstance(sidecar, str): current_files.append(sidecar)
+			# Keep legacy direct string filenames for all artifact keys
+			elif isinstance(manifest.get(key), str): current_files.append(manifest[key])
 		for file in storage.list_files(release_dir):
 			# Build full path for deletion via storage backend
 			full_path = os.path.join(release_dir, file)
