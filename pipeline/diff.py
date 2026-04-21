@@ -214,10 +214,12 @@ def _diff_unchanged(kind, prev_parquet):
 def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clean', rank_col='rank_clean'):
 	# Build scope expression for first-release counting under the source's kind
 	scope_expr = 'accepted' if kind == 'authority' else 'TRUE'
+	# Resolve backend-aware parquet URL for DuckDB (local path or s3:// URL)
+	cur_parquet_url = _duck_path(cur_path)
 	# Count accepted/present rows in current parquet for scope metadata
 	cur_count = db.execute(f"""
 		SELECT COUNT(*) FROM read_parquet($cur) WHERE COALESCE({scope_expr}, FALSE)
-	""", {'cur': cur_path}).fetchone()[0]
+	""", {'cur': cur_parquet_url}).fetchone()[0]
 	# Respect sample cap so a 1.78M-row first IPNI release does not produce a 140 MB sidecar
 	cap = SAMPLE_CAP
 	# Collect capped sample entries mirroring the full-diff entry shape
@@ -246,6 +248,9 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 	tracked_cols = cols if cols is not None else []
 	# Keep only tracked columns that exist on both current and previous parquets
 	tracked_cols = _common_columns(db, cur_path, prev_path, tracked_cols)
+	# Resolve backend-aware parquet URLs for DuckDB reads (local path or s3:// URL)
+	cur_parquet_url = _duck_path(cur_path)
+	prev_parquet_url = _duck_path(prev_path)
 	# Build id/name/rank projections with type-safe string coercion
 	id_expr = f"{id_col}::VARCHAR"
 	name_expr = f"{name_col}" if _column_exists(db, cur_path, name_col) and _column_exists(db, prev_path, name_col) else 'NULL::VARCHAR'
@@ -297,13 +302,13 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 		GROUP BY category
 	"""
 	# Execute diff in one pass against both parquets
-	rows = db.execute(query, {'cur': cur_path, 'prev': prev_path}).fetchall()
+	rows = db.execute(query, {'cur': cur_parquet_url, 'prev': prev_parquet_url}).fetchall()
 	# Collect scope totals for denominator and suspicion computation
 	scope = db.execute(f"""
 		SELECT
 			(SELECT COUNT(*) FROM read_parquet($prev) WHERE COALESCE({scope_expr}, FALSE)) AS prev_scope,
 			(SELECT COUNT(*) FROM read_parquet($cur)  WHERE COALESCE({scope_expr}, FALSE)) AS cur_scope
-	""", {'cur': cur_path, 'prev': prev_path}).fetchone()
+	""", {'cur': cur_parquet_url, 'prev': prev_parquet_url}).fetchone()
 	# Build category-keyed dict from the tagged result rows
 	by_cat = {category: (cnt, samples) for category, cnt, samples in rows}
 	# Extract per-category counts with zero defaults for missing categories
@@ -349,8 +354,10 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 # Check whether a parquet file contains a specific column name
 
 def _column_exists(db, path, column):
+	# Resolve backend-aware parquet URL for DuckDB describe query
+	parquet_url = _duck_path(path)
 	# Query DuckDB describe output for one parquet and count matching columns
-	count = db.execute("SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet($path)) d WHERE d.column_name = $column", {'path': path, 'column': column}).fetchone()[0]
+	count = db.execute("SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet($path)) d WHERE d.column_name = $column", {'path': parquet_url, 'column': column}).fetchone()[0]
 	# Return boolean column existence marker
 	return bool(count)
 
@@ -363,6 +370,8 @@ def _common_columns(db, cur_path, prev_path, candidates):
 # Collect capped first-release samples mirroring full-diff entry shape
 
 def _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col='id_raw', name_col='name_clean', rank_col='rank_clean'):
+	# Resolve backend-aware parquet URL for DuckDB reads
+	cur_parquet_url = _duck_path(cur_path)
 	# Build optional rank expression when rank column is absent on the current parquet
 	rank_expr = rank_col if _column_exists(db, cur_path, rank_col) else 'NULL'
 	# Build optional name expression when name column is absent on the current parquet
@@ -373,7 +382,7 @@ def _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col='id_raw
 		FROM read_parquet($cur)
 		WHERE COALESCE({scope_expr}, FALSE)
 		LIMIT {cap}
-	""", {'cur': cur_path}).fetchall()
+	""", {'cur': cur_parquet_url}).fetchall()
 	# Build entry dicts dropping rank when NULL for consistency with _normalize_entry
 	return [_normalize_entry({'id': r[0], 'name': r[1], 'rank': r[2]}) for r in rows]
 
@@ -395,6 +404,11 @@ def _normalize_entry(entry):
 	if fields: out['fields'] = list(fields)
 	# Return cleaned entry dict ready for JSON serialization
 	return out
+
+# Resolve one parquet path into a DuckDB-readable URL for the active backend
+def _duck_path(path):
+	# Map local filesystem paths to themselves and S3-backed paths to s3:// URLs
+	return storage.parquet_url(path)
 
 # Emit one grep-friendly summary line per source for incident triage
 def _log_source_summary(name, block):
