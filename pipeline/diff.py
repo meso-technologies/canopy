@@ -49,12 +49,20 @@ DIFF_PROFILES = {
 }
 
 # Keep one explicit profile for fused meso accepted-taxa diff reporting
+# Join key is accepted-name consensus only so id_meso re-identification does not churn counts
 MESO_DIFF_PROFILE = {
+	# Use authority scope so shared diff path applies accepted-only semantics
 	'kind': 'authority',
-	'id_col': 'id_meso',
-	'name_col': 'name',
-	'rank_col': 'rank',
-	'cols': ['name', 'rank', 'author', 'year', 'parent_consensus', 'iucn_status'],
+	# Match rows by consensus accepted name only
+	'id_col': 'name_consensus',
+	# Render consensus accepted name in sidecar entries
+	'name_col': 'name_consensus',
+	# Render consensus rank in sidecar entries
+	'rank_col': 'rank_consensus',
+	# Track only agreed meso change fields from consensus output
+	'cols': ['author_consensus', 'year_consensus', 'parent_consensus', 'iucn_status'],
+	# Prefilter both releases to accepted scope before joining by name
+	'prefilter_scope': True,
 }
 
 # Cap sample entry count per category to keep sidecar lean even on wide churn
@@ -186,12 +194,14 @@ def _diff_profile(db, profile, cur_path, cur_parquet, prev_path, prev_parquet):
 	rank_col = profile.get('rank_col', 'rank_clean')
 	# Resolve tracked column list from profile
 	cols = profile.get('cols', [])
+	# Resolve optional mode that prefilters scope before joining
+	prefilter_scope = bool(profile.get('prefilter_scope', False))
 	# First-release path when no baseline or predecessor parquet is missing
 	if not prev_path or not storage.exists(prev_path): return _diff_first_release(db, kind, cur_path, id_col=id_col, name_col=name_col, rank_col=rank_col)
 	# Unchanged-file shortcut when baseline and current processed artifact filenames match
 	if cur_parquet == prev_parquet: return _diff_unchanged(kind, prev_parquet)
 	# Full diff path runs parametric FOJ query across both parquets
-	return _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col=id_col, name_col=name_col, rank_col=rank_col, cols=cols)
+	return _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col=id_col, name_col=name_col, rank_col=rank_col, cols=cols, prefilter_scope=prefilter_scope)
 
 # Emit zero-counts block when source parquet is identical between releases
 def _diff_unchanged(kind, prev_parquet):
@@ -241,9 +251,11 @@ def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clea
 	return diff_block, sidecar
 
 # Run the parametric full-outer-join diff query for one profile
-def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', cols=None):
+def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', cols=None, prefilter_scope=False):
 	# Resolve scope expression once so it participates in both CTEs and samples
 	scope_expr = 'accepted' if kind == 'authority' else 'TRUE'
+	# Resolve scope WHERE predicate once so null acceptance is treated as false
+	scope_where = f"COALESCE({scope_expr}, FALSE)"
 	# Resolve tracked content columns from explicit profile list
 	tracked_cols = cols if cols is not None else []
 	# Keep only tracked columns that exist on both current and previous parquets
@@ -268,29 +280,44 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 	fields_expr = f"list_filter([{', '.join(field_cases)}], x -> x IS NOT NULL)" if field_cases else "[]"
 	# Project tracked columns into one joined table for downstream tagging
 	tracked_select = ', ' + ', '.join(tracked_cols) if tracked_cols else ''
+	# Build CTE WHERE clauses so meso can prefilter accepted rows before joining
+	c_where = f"WHERE {scope_where}" if prefilter_scope else ''
+	p_where = f"WHERE {scope_where}" if prefilter_scope else ''
+	# Build acceptance expression per CTE row
+	acc_expr = 'TRUE' if prefilter_scope else scope_where
+	# Build category case line for added rows under selected mode
+	new_case = "WHEN p.id_key IS NULL THEN 'new'" if prefilter_scope else "WHEN (p.id_key IS NULL OR NOT p.acc) AND c.acc THEN 'new'"
+	# Build category case line for deleted rows under selected mode
+	deleted_case = "WHEN c.id_key IS NULL THEN 'deleted'" if prefilter_scope else "WHEN p.acc AND (c.id_key IS NULL OR NOT c.acc) THEN 'deleted'"
+	# Build category case line for changed rows under selected mode
+	changed_case = f"WHEN p.id_key IS NOT NULL AND c.id_key IS NOT NULL AND ({changed_expr}) THEN 'changed'" if prefilter_scope else f"WHEN p.acc AND c.acc AND ({changed_expr}) THEN 'changed'"
+	# Build fields CASE expression under selected mode
+	fields_case = f"CASE WHEN p.id_key IS NOT NULL AND c.id_key IS NOT NULL AND ({changed_expr}) THEN {fields_expr} ELSE [] END" if prefilter_scope else f"CASE WHEN p.acc AND c.acc AND ({changed_expr}) THEN {fields_expr} ELSE [] END"
 	# Build the parametric FOJ query that tags each row new/changed/deleted in one pass
 	query = f"""
 		WITH c AS (
-			SELECT {id_expr} AS id_key, COALESCE({scope_expr}, FALSE) AS acc,
+			SELECT {id_expr} AS id_key, {acc_expr} AS acc,
 				   {name_expr} AS name_value, {rank_expr} AS rank_value{tracked_select}
 			FROM read_parquet($cur)
+			{c_where}
 		),
 		p AS (
-			SELECT {id_expr} AS id_key, COALESCE({scope_expr}, FALSE) AS acc,
+			SELECT {id_expr} AS id_key, {acc_expr} AS acc,
 				   {name_expr} AS name_value, {rank_expr} AS rank_value{tracked_select}
 			FROM read_parquet($prev)
+			{p_where}
 		),
 		tagged AS (
 			SELECT COALESCE(c.id_key, p.id_key) AS id,
 				CASE
-					WHEN (p.id_key IS NULL OR NOT p.acc) AND c.acc       THEN 'new'
-					WHEN p.acc AND (c.id_key IS NULL OR NOT c.acc)        THEN 'deleted'
-					WHEN p.acc AND c.acc AND ({changed_expr})             THEN 'changed'
+					{new_case}
+					{deleted_case}
+					{changed_case}
 				END AS category,
 				COALESCE(c.name_value, p.name_value) AS name,
 				COALESCE(c.rank_value, p.rank_value) AS rank,
 				-- Fields list is only meaningful on changed entries where both sides exist
-				CASE WHEN p.acc AND c.acc AND ({changed_expr}) THEN {fields_expr} ELSE [] END AS diff_fields
+				{fields_case} AS diff_fields
 			FROM c FULL OUTER JOIN p USING (id_key)
 		)
 		SELECT
@@ -306,8 +333,8 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 	# Collect scope totals for denominator and suspicion computation
 	scope = db.execute(f"""
 		SELECT
-			(SELECT COUNT(*) FROM read_parquet($prev) WHERE COALESCE({scope_expr}, FALSE)) AS prev_scope,
-			(SELECT COUNT(*) FROM read_parquet($cur)  WHERE COALESCE({scope_expr}, FALSE)) AS cur_scope
+			(SELECT COUNT(*) FROM read_parquet($prev) WHERE {scope_where}) AS prev_scope,
+			(SELECT COUNT(*) FROM read_parquet($cur)  WHERE {scope_where}) AS cur_scope
 	""", {'cur': cur_parquet_url, 'prev': prev_parquet_url}).fetchone()
 	# Build category-keyed dict from the tagged result rows
 	by_cat = {category: (cnt, samples) for category, cnt, samples in rows}

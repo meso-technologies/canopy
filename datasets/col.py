@@ -16,6 +16,15 @@
 # 		* Tortricid.net * WCO * WOL * World Ferns * World Plants * WSC (a new import via API) * WoRMS, 65 checklists
 #
 # 		#### Other changes: * Systema Dipterorum ver. 5.6 of Dec 2024 and ReptileDB of Mar 2024 re-synced.
+#
+# 		Operational note (2026-04): CoL publishes roughly monthly releases (recent ~22-41 day spacing, median ~29 days)
+# 		through ChecklistBank with explicit release metadata, quality markers, and governance roles. References:
+# 		https://api.checklistbank.org/dataset/3 (working project), https://api.checklistbank.org/dataset/314909 (COL26.4),
+# 		https://raw.githubusercontent.com/CatalogueOfLife/data/master/release-config.yaml (release config + governance notes),
+# 		and the governance principles paper https://link.springer.com/article/10.1007/s13127-021-00516-w.
+#
+# 		Data policy here stays conservative for year voting inputs: keep CoL year extraction narrow and high-confidence for fuse,
+# 		while treating broader publication-year hints as optional future side signals (separate columns) to avoid swaying consensus.
 
 source = {
     "name": "col",
@@ -55,7 +64,8 @@ def process_col(source: dict):
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
 		# Load TSVs — quotechar='\0' disables quoting (CoL fields contain unescaped quotes)
-		name_tsv = db.read_csv(zip.open('NameUsage.tsv'),parallel=True,null_padding=True, delimiter='\t', quotechar='\0')
+		# Force mixed-form authorship year column to VARCHAR to avoid BIGINT inference/binder failures
+		name_tsv = db.read_csv(zip.open('NameUsage.tsv'),parallel=True,null_padding=True, delimiter='\t', quotechar='\0', dtype={'col:combinationAuthorshipYear': 'VARCHAR'})
 		vernacular_tsv = db.read_csv(zip.open('VernacularName.tsv'),parallel=True,null_padding=True, delimiter='\t', quotechar='\0')
 		# col:areaID forced to VARCHAR because mixed numeric/text values cause type detection failures
 		distribution_tsv = db.read_csv(zip.open('Distribution.tsv'),parallel=True,null_padding=True, delimiter='\t', quotechar='\0', dtype={'col:areaID': 'VARCHAR'})
@@ -126,7 +136,12 @@ def process_col(source: dict):
 			ALTER TABLE col ADD COLUMN bhl_title UINTEGER;
 			UPDATE col SET
 				-- issued.date-parts -> year, preferred over combinationAuthorshipYear
-			 	year = COALESCE(CASE WHEN NOT signbit(flatten(r.issued."date-parts")[1]) THEN flatten(r.issued."date-parts")[1] ELSE NULL END, col.year),
+			 	year = COALESCE(
+		 			CASE WHEN NOT signbit(flatten(r.issued."date-parts")[1]) THEN flatten(r.issued."date-parts")[1] ELSE NULL END,
+		 			col.year,
+		 			-- strict title fallback -> trailing parenthesized year only, e.g. "... (1957)"
+		 			CAST(NULLIF(REGEXP_EXTRACT(r.title, '\\((\\d{{4}})\\)\\s*$', 1), '') AS USMALLINT)
+		 		),
 				-- container-title -> short publication name, max 120 chars
 			 	publication_short = substring(trim(REGEXP_EXTRACT(REGEXP_REPLACE(r."container-title", '^(In: |in )', ''), { publication_filter }, 1)), 1, 120),
 				-- DOI -> BHL title ID when DOI contains bhl.title pattern
