@@ -107,6 +107,38 @@ checks = [
 		'none',
 		'Wikipedia page sentinel missing for malus domestica leontopodium nivale or vaccinium myrtillus'
 	),
+	# Lock parent-canonical sentinels that previously drifted between duplicate genus rows.
+	# These exact accepted genus rows have strong multi-authority support and high child counts.
+	# We pass when all rows exist as accepted GENUS parents with enough children still attached.
+	(
+		'canonical_genus_parent_sentinels',
+		"""
+		-- Return stable parent genera that are missing, unaccepted, wrong rank, or lost most children.
+		WITH expected(name_consensus, author_consensus, year_consensus, min_children) AS (VALUES ('epidendrum','L.',1763,1500),('erica','L.',1753,750),('sphagnum','L.',1753,250),('bazzania','Gray',1821,200),('wedelia','Jacq.',1760,140))
+		SELECT e.name_consensus, e.author_consensus, e.year_consensus, e.min_children, m.accepted, m.rank_consensus, m.child_count
+		FROM expected e
+		LEFT JOIN meso m ON m.name_consensus = e.name_consensus AND m.author_consensus = e.author_consensus AND m.year_consensus = e.year_consensus
+		WHERE m.id_meso IS NULL OR NOT m.accepted OR m.rank_consensus != 'GENUS' OR COALESCE(m.child_count, 0) < e.min_children
+		""",
+		'none',
+		'Canonical genus parent sentinel missing unaccepted wrong rank or child count below floor'
+	),
+	# Lock Wikidata exact-name assignment sentinels from ambiguous external-ID cases.
+	# These stable accepted species have exact Wikidata name matches and six accepted authority signals.
+	# We pass when the fused row keeps the expected Meso UUID and cross-source IDs.
+	(
+		'wikidata_exact_name_id_stability',
+		"""
+		-- Return stable accepted species whose Wikidata/source IDs drifted away from exact-name assignments.
+		WITH expected(name_consensus, id_meso, wikidata_id, gbif_id, col_id, inaturalist_id, wcvp_id, powo_id, wfo_id) AS (VALUES ('averrhoa carambola','39d0a0ff-4b49-5f9e-ad22-2b0030ee3d03'::UUID,'Q159447',9407103,'K327',146977,2666746,'371870-1','wfo-0000557405'),('comarum palustre','b2f0c3e6-94ae-56c7-8c2c-bfd7c3684ea7'::UUID,'Q18198979',3020532,'XDR2',62213,2943891,'63773-2','wfo-0000985679'),('fragaria ananassa','a543c1c8-9afb-5e04-b571-479ddbeefe02'::UUID,'Q13158',3029912,'6JK32',55366,2948609,'30117681-2','wfo-0001005541'),('neottia ovata','37d7eea7-4649-53c5-b87b-5ff49e28457c'::UUID,'Q15502088',2816250,'CDR5G',341154,134271,'645363-1','wfo-0000250598'),('tetragonia tetragonoides','6c589398-8031-552b-a790-18e91e691536'::UUID,'Q278283',5554574,'7C2YJ',418653,2445492,'364795-1','wfo-0000414976'))
+		SELECT e.name_consensus, e.id_meso, m.wikidata_id, m.gbif_id, m.col_id, m.inaturalist_id, m.wcvp_id, m.powo_id, m.wfo_id
+		FROM expected e
+		LEFT JOIN meso m ON m.id_meso = e.id_meso
+		WHERE m.id_meso IS NULL OR NOT m.accepted OR m.name_consensus != e.name_consensus OR m.wikidata_id != e.wikidata_id OR m.gbif_id != e.gbif_id OR m.col_id != e.col_id OR m.inaturalist_id != e.inaturalist_id OR m.wcvp_id != e.wcvp_id OR m.powo_id != e.powo_id OR m.wfo_id != e.wfo_id
+		""",
+		'none',
+		'Wikidata exact-name ID sentinel missing unaccepted or cross-source IDs changed'
+	),
 	# Lock known-good GBIF sentinels with exact name+id and embedded geo payload.
 	# This asserts accepted row identity and verifies geo embedding produced map-ready data.
 	# We pass when query returns zero regressions.

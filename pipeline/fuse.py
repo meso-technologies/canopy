@@ -364,14 +364,49 @@ def add_ids(results: dict, db: duckdb.DuckDBPyConnection):
 		db.execute(f"""ALTER TABLE meso ADD COLUMN IF NOT EXISTS {id} {'UINTEGER' if id in int_ids else 'VARCHAR'};""")
 		# Wikidata doesn't have wcvp, and don't self reference
 		if source in ['wcvp','wikidata']: continue
-		# Add ID
-		db.execute(f"""UPDATE meso m SET wikidata_id = w.id_raw FROM wikidata w WHERE wikidata_id IS NULL AND w.{id} IS NOT NULL AND m.{id} = w.{id};""")
+		# Add Wikidata ID with deterministic tie-breaking when one authority ID maps to multiple Wikidata rows
+		db.execute(f"""
+			WITH wikidata_matches AS (
+				-- Pick exactly one Wikidata row per meso row so UPDATE FROM cannot choose an arbitrary match
+				SELECT DISTINCT ON (m.rowid) m.rowid AS meso_rowid, w.id_raw AS wikidata_id
+				-- Match through the current authority ID because Wikidata links many external identifiers
+				FROM meso m
+				-- Keep this as an equality join so DuckDB can use a hash join instead of row-wise lookups
+				JOIN wikidata w ON w.{id} IS NOT NULL AND m.{id} = w.{id}
+				-- Only assign rows that have not already been matched by a higher-priority authority
+				WHERE m.wikidata_id IS NULL
+				-- Keep rows grouped by target row for DISTINCT ON
+				ORDER BY m.rowid,
+					-- Prefer Wikidata names that agree with the Meso name to avoid synonym/accepted cross-fills
+					CASE WHEN w.name_clean = m.name_clean THEN 0 ELSE 1 END,
+					-- Prefer better-supported Wikidata entries when several same-name candidates exist
+					COALESCE(w.page_count, 0) DESC,
+					-- Finish with stable QID ordering so identical inputs produce identical outputs
+					w.id_raw
+			)
+			-- Apply the pre-ranked mapping with one source row per target row
+			UPDATE meso SET wikidata_id = wm.wikidata_id
+			FROM wikidata_matches wm WHERE meso.rowid = wm.meso_rowid;
+		""")
 	initial_count = db.execute("SELECT COUNT(wikidata_id) FROM meso").fetchone()[0]
 	mesologger.info(f"""Added {initial_count:,} Wikidata IDs via core authority IDs""")
 	# Try backfilling rest via name, eg Angiosperms have no core IDs
 	db.execute(f"""
-		UPDATE meso m SET wikidata_id = w.id_raw FROM wikidata w 
-		WHERE wikidata_id IS NULL AND m.name_clean = w.name_clean AND NOT EXISTS (SELECT 1 FROM meso WHERE wikidata_id = w.id_raw);
+		WITH wikidata_name_matches AS (
+			-- Pick exactly one same-name Wikidata row per meso row for deterministic name fallback
+			SELECT DISTINCT ON (m.rowid) m.rowid AS meso_rowid, w.id_raw AS wikidata_id
+			-- Restrict this fallback to exact cleaned names to avoid broad Wikidata cross-fills
+			FROM meso m
+			-- Match names directly after authority-ID matching has had first chance
+			JOIN wikidata w ON m.name_clean = w.name_clean
+			-- Avoid reusing a Wikidata row that was already assigned to another meso row
+			WHERE m.wikidata_id IS NULL AND NOT EXISTS (SELECT 1 FROM meso used WHERE used.wikidata_id = w.id_raw)
+			-- Prefer better-supported entries and then stable QID ordering among same-name candidates
+			ORDER BY m.rowid, COALESCE(w.page_count, 0) DESC, w.id_raw
+		)
+		-- Apply the ranked same-name Wikidata fallback
+		UPDATE meso SET wikidata_id = wm.wikidata_id
+		FROM wikidata_name_matches wm WHERE meso.rowid = wm.meso_rowid;
 	""")	
 	mesologger.info(f"Added {int(db.execute("SELECT COUNT(wikidata_id) FROM meso").fetchone()[0]-initial_count):,} more Wikidata IDs via name match")
 	# See if we have any IDs that we didn't correlate when building the initial backbone - keep seperate from loop above as coalesce() would otherwise slow both down
@@ -385,16 +420,26 @@ def add_ids(results: dict, db: duckdb.DuckDBPyConnection):
 		# Don't do Wikidata again, and we can also be sure to have 100% of ipni and fungorum when we started the table
 		if authority in ['wikidata','ipni','fungorum','ncbi']: continue
 		before = db.execute(f"SELECT COUNT({authority}_id) FROM meso").fetchone()[0]
+		# Prefer accepted GBIF rows when exact-name matching has multiple source candidates
+		if authority == 'gbif': authority_order = "CASE WHEN a.status_clean = 'accepted' THEN 0 WHEN a.status_clean = 'synonym' THEN 1 ELSE 2 END, a.id_raw::VARCHAR"
+		# Otherwise use stable source ID ordering so DuckDB never chooses an arbitrary update row
+		else: authority_order = "a.id_raw::VARCHAR"
 		db.execute(f"""
 			WITH single_matches AS (
-				SELECT m.rowid AS meso_rowid, a.id_raw AS auth_id
+				-- Pick exactly one source ID per target row so exact-name fallback is deterministic
+				SELECT DISTINCT ON (m.rowid) m.rowid AS meso_rowid, a.id_raw AS auth_id
+				-- Scan the authority table once and join by cleaned name
 				FROM {authority} a
 				JOIN (
-					-- For each name_clean, get exactly one meso row
-					SELECT DISTINCT ON (name_clean) rowid, name_clean FROM meso WHERE {authority}_id IS NULL
+					-- For each name_clean, get exactly one meso row deterministically
+					SELECT DISTINCT ON (name_clean) rowid, name_clean FROM meso WHERE {authority}_id IS NULL ORDER BY name_clean, rowid
 				) m ON m.name_clean = a.name_clean
+				-- Do not assign an authority ID that is already linked to another meso row
 				WHERE NOT EXISTS (SELECT 1 FROM meso WHERE {authority}_id = a.id_raw)
+				-- Prefer accepted GBIF rows via authority_order and always finish with stable source ID ordering
+				ORDER BY m.rowid, {authority_order}
 			)
+			-- Apply the one-row-per-target fallback mapping
 			UPDATE meso SET {authority}_id = sm.auth_id
 			FROM single_matches sm WHERE meso.rowid = sm.meso_rowid;
 		""")
@@ -1085,20 +1130,78 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		# Remember count for next round
 		previous_count = current_count
 	mesologger.info("Accepted all parents we could find recursively")
+	# Count filled authority IDs to prefer source-rich parent rows over sparse duplicate-name siblings
+	id_list = ', '.join([
+		f'CAST(m.{auth}_id AS VARCHAR)' if f'{auth}_id' in int_ids else f'm.{auth}_id'
+		for auth in core_authorities
+	])
 	# Dedupe parents
 	db.execute(f"""
-		-- First create a temp table for duplicated parents
+		-- Count referenced parent UUIDs first so parent canonicalization only scans rows that matter
+		CREATE TEMP TABLE parent_refs AS
+		SELECT parent_consensus AS id_meso, COUNT(*) AS ref_count
+		FROM meso
+		WHERE parent_consensus IS NOT NULL
+		GROUP BY parent_consensus;
+		-- Project only referenced parent rows and their ranking signals to avoid a broad self-join
+		CREATE TEMP TABLE parent_rows AS
+		SELECT
+			-- Candidate parent UUID that children may currently point to
+			m.id_meso,
+			-- Duplicate parent names are canonicalized within this key
+			m.name_consensus,
+			-- Prefer parents accepted by more real taxonomy authorities
+			COALESCE(len(m.accepted_by), 0) AS acceptance_count,
+			-- Penalize parents considered synonyms by more authorities
+			COALESCE(len(m.considered_synonym), 0) AS synonym_count,
+			-- Prefer rows with richer cross-source ID coverage when acceptance support ties
+			len(list_filter([{id_list}], lambda x: x IS NOT NULL)) AS authority_count,
+			-- Keep child reference count as a later tie-break without letting polluted references dominate
+			r.ref_count
+		FROM meso m
+		JOIN parent_refs r USING (id_meso);
+		-- First create a temp table for duplicated parents with deterministic authority-first ranking
 		CREATE TEMP TABLE duplicated_parents AS
-		SELECT name_consensus, MODE(id_meso) AS canonical_id
-		FROM meso WHERE id_meso IN (SELECT parent_consensus FROM meso WHERE parent_consensus IS NOT NULL)
-		GROUP BY name_consensus HAVING COUNT(DISTINCT id_meso) > 1;
+		WITH duplicate_parent_names AS (
+			-- Only names with multiple referenced UUIDs need canonical parent selection
+			SELECT name_consensus
+			FROM parent_rows
+			GROUP BY name_consensus
+			HAVING COUNT(DISTINCT id_meso) > 1
+		), ranked_parents AS (
+			SELECT
+				-- Keep the duplicate parent name for later child rewrites
+				p.name_consensus,
+				-- Candidate UUID for this parent name
+				p.id_meso,
+				-- Rank candidates by source support and stable tie-breaks instead of arbitrary MODE
+				ROW_NUMBER() OVER (
+					PARTITION BY p.name_consensus
+					ORDER BY
+						-- Strong multi-authority accepted support should win over sparse siblings
+						p.acceptance_count DESC,
+						-- Richer authority ID coverage is the next best signal for canonical identity
+						p.authority_count DESC,
+						-- Prefer rows that fewer authorities consider synonyms
+						p.synonym_count ASC,
+						-- Use current child convergence only after source-quality signals
+						p.ref_count DESC,
+						-- Finish with UUID ordering so identical inputs produce identical outputs
+						p.id_meso::VARCHAR ASC
+				) AS rn
+			FROM parent_rows p
+			JOIN duplicate_parent_names d USING (name_consensus)
+		)
+		SELECT name_consensus, id_meso AS canonical_id
+		FROM ranked_parents
+		WHERE rn = 1;
 		-- Also create a temp table for non-canonical parents
 		CREATE TEMP TABLE non_canonical_parents AS
 		SELECT m.id_meso AS non_canonical_id, dp.canonical_id
 		FROM duplicated_parents dp
 		JOIN meso m ON m.name_consensus = dp.name_consensus
 		WHERE m.id_meso != dp.canonical_id
-		AND m.id_meso IN (SELECT parent_consensus FROM meso WHERE parent_consensus IS NOT NULL);
+		AND m.id_meso IN (SELECT id_meso FROM parent_refs);
 		-- Update the children to point to canonical parents
 		UPDATE meso SET parent_consensus = dp.canonical_id
 		FROM duplicated_parents dp
@@ -1111,6 +1214,8 @@ def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 		-- Drop the temp tables when done
 		DROP TABLE duplicated_parents;
 		DROP TABLE non_canonical_parents;
+		DROP TABLE parent_rows;
+		DROP TABLE parent_refs;
 	""")
 	mesologger.info("Deduplicated parentage")
 	# Run dedupe names again
@@ -1196,11 +1301,14 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 		# GBIF special cases as we have accepted etc metadata (NCBI is name and ID only)
 		if source == 'gbif':
 			# Replace outdated GBIF IDs with current accepted ones 
-			# Step 1: Create a lookup table with unique name values
+			# Step 1: Create a deterministic lookup table with unique accepted name values
 			db.execute(f"""
 				CREATE TEMP TABLE name_accepted AS
-					SELECT name_clean, MODE(id_raw) as accepted_id
+					-- Choose one accepted GBIF ID per name so MODE cannot flip between equal candidates
+					SELECT name_clean, FIRST(id_raw ORDER BY id_raw) as accepted_id
+					-- Only accepted GBIF rows should replace obsolete synonym/problematic IDs
 					FROM {source} WHERE status_clean = 'accepted'
+					-- Keep one lookup row per cleaned name for the later hash join
 					GROUP BY name_clean;
 			""")
 			# Step 2: Simple hash join update with COALESCE to preserve original if no accepted alternative
@@ -1219,9 +1327,14 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 			# Add accepted GBIF IDs to remaining NULL rows first
 			result = db.execute(f"""
 				UPDATE meso SET {source}_id = (
+					-- Prefer accepted GBIF IDs before falling back to any same-name GBIF row
 					SELECT s.id_raw FROM {source} s 
+					-- Match the final consensus name rather than an earlier raw/source name
 					WHERE s.name_clean = meso.name_consensus 
+					-- Restrict this first pass to accepted GBIF records only
 					AND s.status_clean = 'accepted'
+					-- Make LIMIT 1 deterministic for names with multiple accepted GBIF rows
+					ORDER BY s.id_raw
 					LIMIT 1
 				)
 				WHERE meso.accepted 
@@ -1229,11 +1342,19 @@ def polish(results: dict, db: duckdb.DuckDBPyConnection):
 				RETURNING 1;
 			""").fetchall()
 			mesologger.info(f"Added {len(result):,} accepted {source.upper()} IDs by name matching")
+		# Prefer accepted GBIF rows when final name matching still has multiple candidates
+		if source == 'gbif': source_order = "CASE WHEN s.status_clean = 'accepted' THEN 0 WHEN s.status_clean = 'synonym' THEN 1 ELSE 2 END, s.id_raw"
+		# Otherwise keep final name matching deterministic by source ID
+		else: source_order = "s.id_raw"
 		# Try adding the remaining IDs we might have
 		result = db.execute(f"""
 			UPDATE meso SET {source}_id = (
+				-- Fill the remaining accepted rows from same-name source records
 				SELECT s.id_raw FROM {source} s 
+				-- Match on final consensus name so this stays aligned with release identity
 				WHERE s.name_clean = meso.name_consensus 
+				-- Keep LIMIT 1 deterministic and prefer accepted GBIF records when available
+				ORDER BY {source_order}
 				LIMIT 1
 			)
 			WHERE meso.accepted 
