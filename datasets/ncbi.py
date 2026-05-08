@@ -60,6 +60,26 @@ DMP_OPTS = dict(delimiter='\t|\t', header=False, quotechar='', parallel=True)
 # SQL snippet that trims the trailing "\t|" left by the row terminator on the last column
 TRAIL = "chr(9) || '|'"
 
+# NCBI is cross-domain; keep only Meso-relevant plants, fungi, algae, and fungi-like groups.
+# These are lineage roots, not rank='kingdom' filters, because NCBI leaves several relevant algal/protist
+# groups with no kingdom in rankedlineage.dmp.
+MESO_SCOPE_ROOTS = (
+	33090,   # Viridiplantae
+	4751,    # Fungi
+	2763,    # Rhodophyta, red algae
+	2696291, # Ochrophyta, brown algae / diatoms / golden algae
+	2830,    # Haptophyta
+	3027,    # Cryptophyceae
+	2864,    # Dinophyceae, dinoflagellates
+	38254,   # Glaucocystophyceae
+	33682,   # Euglenozoa, includes euglenoid algae
+	4762,    # Oomycota, fungi-like stramenopiles
+	142796,  # Eumycetozoa, slime molds
+	2779609, # Phytomyxea, plasmodiophorid plant parasites
+	1117,    # Cyanobacteriota, blue-green algae
+	419944,  # Picozoa, pico-algal/protist edge cases
+)
+
 # Main function called as asyncio Task from run.py
 async def update_ncbi(session):
 	mesologger.info(f"############### Starting NCBI Update  ###############")
@@ -117,9 +137,18 @@ def process_ncbi(source: dict):
 # so NCBI can contribute to the author consensus vote in fuse.basic_consensus
 def build_core_table(db: duckdb.DuckDBPyConnection):
 	# Build the core table via a CTE that pivots scientific-name + authority rows onto one row per taxid
-	db.execute("""
+	db.execute(f"""
 		CREATE TABLE ncbi AS
-		WITH sci AS (
+		WITH RECURSIVE scope(taxid) AS (
+			-- Start from explicit Meso-relevant lineage roots instead of rank='kingdom' labels.
+			SELECT taxid FROM nodes WHERE taxid IN {MESO_SCOPE_ROOTS}
+			UNION ALL
+			-- Walk downward through the NCBI parent chain so every descendant taxon is retained.
+			SELECT n.taxid FROM nodes n JOIN scope s ON n.parent = s.taxid WHERE n.taxid <> n.parent
+		), eligible AS (
+			-- Deduplicate in case any future root is nested under another selected root.
+			SELECT DISTINCT taxid FROM scope
+		), sci AS (
 			-- The scientific-name row is the authoritative single name per taxid
 			SELECT taxid, name AS sci_name FROM names WHERE name_class = 'scientific name'
 		), auth AS (
@@ -147,6 +176,7 @@ def build_core_table(db: duckdb.DuckDBPyConnection):
 			-- Result looks like "(L.) Heynh., 1842" or "L., 1753" or NULL when no authority row.
 			NULLIF(trim(substring(a.authority_name, length(s.sci_name) + 1)), '') AS author_raw
 		FROM nodes n
+		JOIN eligible e ON e.taxid = n.taxid
 		JOIN sci s ON s.taxid = n.taxid
 		LEFT JOIN auth a ON a.taxid = n.taxid;
 	""")
