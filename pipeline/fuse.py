@@ -772,8 +772,8 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 
 # Walk up the parentage tree to add higher ranks
 def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
-	# Vote on parents first
-	vote(results,db,'parent_raw',core_authorities)
+	# Vote on parents first, but keep MyCoBank out of normal consensus because its sparse paths can overwrite richer chains
+	vote(results,db,'parent_raw',[a for a in core_authorities if a != 'mycobank'])
 	# Fix orphaned species by linking to their genus
 	id_list = ', '.join([
 		f'CAST({auth}_id AS VARCHAR)' if f'{auth}_id' in int_ids else f'{auth}_id' 
@@ -786,6 +786,8 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 			SELECT id_meso 
 			FROM meso AS parent
 			WHERE parent.name_consensus = SPLIT_PART(meso.name_consensus, ' ', 1)
+			-- Keep homonymous genera from crossing kingdoms, e.g. fungal Micropera attaching to orchid Micropera
+			AND parent.kingdom = meso.kingdom
 			AND parent.rank_consensus = 'GENUS'
 			ORDER BY len(list_filter([{id_list}], lambda x: x IS NOT NULL)) DESC
 			LIMIT 1
@@ -802,7 +804,9 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 			SELECT id_meso 
 			FROM meso AS parent
 			WHERE parent.name_consensus = SPLIT_PART(meso.name_consensus, ' ', 1) || ' ' || SPLIT_PART(meso.name_consensus, ' ', 2)
-			-- Enforce correct rank, otherwise we accidentally attach to unaccepted Sections etc
+			-- Keep homonymous species from crossing kingdoms during name-prefix fallback
+			AND parent.kingdom = meso.kingdom
+			-- Keep this name-prefix fallback narrow; real source parentage can still attach sections etc when explicitly supplied
 			AND parent.rank_consensus = 'SPECIES'
 			ORDER BY len(list_filter([{id_list}], lambda x: x IS NOT NULL)) DESC
 			LIMIT 1

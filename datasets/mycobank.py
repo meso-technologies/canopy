@@ -66,6 +66,63 @@ def process_mycobank(source: dict):
 			FROM mb_raw
 		""")
 		mesologger.info(f"Loaded {db.execute('SELECT COUNT(*) FROM ' + source['name']).fetchone()[0]:,} fungi from { source['name'] }")	
+		# Add parent placeholders before generic cleanup preserves only validated output columns
+		db.execute("""
+			ALTER TABLE mycobank ADD COLUMN parent_raw VARCHAR;
+		""")
+		# Resolve immediate parents from the last Classification segment without skipping intermediary ranks
+		db.execute("""
+			CREATE TEMP TABLE mycobank_parent_lookup AS
+			WITH children AS (
+				-- Keep the spreadsheet row ID only for deterministic lookup within duplicate MycoBank numbers
+				SELECT
+					"ID" AS link_id,
+					"MycoBank #" AS child_id,
+					"Taxon name" AS child_name,
+					Classification AS classification_raw,
+					string_split(Classification, ', ')[array_length(string_split(Classification, ', '))] AS parent_name
+				FROM mb_raw
+				WHERE Classification IS NOT NULL
+				AND trim(Classification) NOT IN ('', '-', '?')
+			),
+			candidates AS (
+				-- Match the immediate parent name back to the source table and require path containment for ambiguity control
+				SELECT
+					c.link_id,
+					c.child_id,
+					p."MycoBank #" AS parent_id,
+					p.Classification AS parent_classification
+				FROM children c
+				JOIN mb_raw p ON p."Taxon name" = c.parent_name
+				WHERE p.Classification IS NOT NULL
+				AND trim(p.Classification) NOT IN ('', '-', '?')
+				AND starts_with(c.classification_raw, p.Classification)
+				AND p."MycoBank #" != c.child_id
+			),
+			ranked_links AS (
+				-- Prefer the deepest matching parent path for homonyms
+				SELECT *, row_number() OVER (PARTITION BY link_id ORDER BY length(parent_classification) DESC, parent_id) AS link_rank
+				FROM candidates
+			),
+			ranked_children AS (
+				-- Keep one stable parent per MycoBank number because the source has a handful of duplicate numbers
+				SELECT *, row_number() OVER (PARTITION BY child_id ORDER BY TRY_CAST(link_id AS UINTEGER), length(parent_classification) DESC, parent_id) AS child_rank
+				FROM ranked_links
+				WHERE link_rank = 1
+			)
+			SELECT child_id, parent_id
+			FROM ranked_children
+			WHERE child_rank = 1;
+		""")
+		# Store immediate MycoBank parent IDs so fuse can resolve them through existing parent voting
+		db.execute("""
+			UPDATE mycobank
+			SET parent_raw = mpl.parent_id
+			FROM mycobank_parent_lookup mpl
+			WHERE mycobank.id_raw = mpl.child_id;
+		""")
+		# Log parent coverage for source-shape drift detection
+		mesologger.info(f"Resolved {db.execute('SELECT COUNT(parent_raw) FROM mycobank').fetchone()[0]:,} MycoBank parent links")
 		# db.sql("SUMMARIZE mb_raw").show(max_rows=100)
 		# db.sql("SELECT Classification FROM mb_raw").show(max_rows=100)
 		# db.sql(f"""SELECT DISTINCT "Classification", COUNT("Classification") FROM mb_raw GROUP BY "Classification" ORDER BY COUNT("Classification") DESC""").show(max_rows=30)

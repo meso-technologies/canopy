@@ -124,7 +124,7 @@ def build_rank_and_status(db: duckdb.DuckDBPyConnection, source: dict):
             WHEN l.rank_raw_lower IN ('division', 'div.','phylum','superphylum') THEN 'phylum'
             WHEN l.rank_raw_lower IN ('subdivision', 'subdiv.','subdivf.','subphylum','cohort') THEN 'subphylum'
             WHEN l.rank_raw_lower IN ('order', 'ordo','superorder') THEN 'order'
-            WHEN l.rank_raw_lower IN ('suborder','infraorder','parvorder') THEN 'suborder'
+            WHEN l.rank_raw_lower IN ('suborder','subordo','infraorder','parvorder') THEN 'suborder'
             WHEN l.rank_raw_lower IN ('class', 'cl.','superclass') THEN 'class'
             WHEN l.rank_raw_lower IN ('subclass', 'subcl.','infraclass') THEN 'subclass'
             WHEN l.rank_raw_lower IN ('family', 'fam.','superfamily') THEN 'family'
