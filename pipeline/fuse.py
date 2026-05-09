@@ -98,13 +98,17 @@ def fuse(results):
 		if settings.VERBOSE: db.sql("SUMMARIZE meso;").show()
 		# REDUCE phase: collapse to accepted taxa and stable parent hierarchy
 		mesologger.info(f"############### Reducing Backbone ###############")
-		# Add higher level ranks 
-		add_higher_ranks(results, db)
-		# Decide which species etc we want to build pages for
+		# Pre-create higher rank columns as NULL so dedupe_names can MODE-aggregate them safely
+		# add_higher_ranks fills them later when it walks the parent tree
+		for rank in higher_ranks:
+			db.execute(f"ALTER TABLE meso ADD COLUMN IF NOT EXISTS {rank} VARCHAR;")
+		# Decide acceptance first from direct authority votes at all ranks
 		decide_acceptance(results, db)
-		# Make sure we ever only accept one unique name
+		# Enforce one accepted row per name on the directly-accepted set
 		dedupe_names(results,db)
-		# Consolidate all parents
+		# Build parent links and higher ranks over the established accepted set
+		add_higher_ranks(results, db)
+		# Final parent hygiene now that the tree is built over accepted rows
 		consolidate_parents(results, db)
 		# Add any potential GBIF, NCBI etc name matches, fix dangling parents
 		polish(results, db)
@@ -789,6 +793,8 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 			-- Keep homonymous genera from crossing kingdoms, e.g. fungal Micropera attaching to orchid Micropera
 			AND parent.kingdom = meso.kingdom
 			AND parent.rank_consensus = 'GENUS'
+			-- Only link to the canonical accepted genus row since acceptance is settled before this step
+			AND parent.accepted
 			ORDER BY len(list_filter([{id_list}], lambda x: x IS NOT NULL)) DESC
 			LIMIT 1
 		)
@@ -808,6 +814,8 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 			AND parent.kingdom = meso.kingdom
 			-- Keep this name-prefix fallback narrow; real source parentage can still attach sections etc when explicitly supplied
 			AND parent.rank_consensus = 'SPECIES'
+			-- Only link infraspecifics to the canonical accepted species row
+			AND parent.accepted
 			ORDER BY len(list_filter([{id_list}], lambda x: x IS NOT NULL)) DESC
 			LIMIT 1
 		)
@@ -931,7 +939,7 @@ def add_higher_ranks(results: dict, db: duckdb.DuckDBPyConnection):
 	# Add back to DuckDB
 	db.execute(f"""
 		-- Create columns (including those for which we might not have a dataframe in debug mode)
-		{'; '.join([f'ALTER TABLE meso ADD COLUMN {rank} VARCHAR;' for rank in higher_ranks])};	
+		{'; '.join([f'ALTER TABLE meso ADD COLUMN IF NOT EXISTS {rank} VARCHAR;' for rank in higher_ranks])};	
 		-- Add data
 			UPDATE meso SET {', '.join([f'{rank} = fd.{rank}' for rank in existing_ranks])}
 			FROM final_df fd WHERE meso.id_meso = fd.child_id
@@ -952,7 +960,9 @@ def decide_acceptance(results: dict, db: duckdb.DuckDBPyConnection):
 	# DONE: See how we can handle fungi given that neither Mycobank nor Fungorum provide reliable taxon acceptance data (use CoL for now)
 	authorities = {
 		'plantae': 	['wcvp','powo','wfo','col','inaturalist','gbif'],
-		# CoL is basically the Species Fungorum column missing in the Fungorum dataset 
+		# CoL is basically the Species Fungorum column missing in the Fungorum dataset.
+		# MycoBank is intentionally NOT here: its status_clean='accepted' is permissive (maps Deleted→accepted)
+		# and would inflate fungi acceptance by ~280k taxa. Use it as a soft-cascade hint below instead.
 		'fungi': 	['col','inaturalist','gbif']
 	}
 	# Add pool and acceptance columns once before looping kingdoms
@@ -978,8 +988,10 @@ def decide_acceptance(results: dict, db: duckdb.DuckDBPyConnection):
 		db.execute(f"""UPDATE meso SET synonym = (list_any_value(considered_synonym) IS NOT NULL) WHERE kingdom = '{kingdom}';""")
 		# Also add wikidata acceptance for entries that have more than 6 wikipedia pages and aren't synonyms
 		db.execute(f"""UPDATE meso SET accepted_by = list_append(accepted_by,'wikidata') WHERE kingdom = '{kingdom}' AND NOT synonym AND wikidata_pagecount > 6 AND meso.rank_consensus >= 'SPECIES'::taxon_rank_enum;""")	
-		# Set accepted flag for Species and up right away, for all where at least one authority accepted it or nobody thinks it's a synonym
-		db.execute(f"""UPDATE meso SET accepted = TRUE WHERE list_any_value(accepted_by) IS NOT NULL AND kingdom = '{kingdom}' AND rank_consensus >= 'SPECIES'::taxon_rank_enum;""")
+		# Accept any rank where at least one authority directly voted accepted
+		# Higher ranks (genus, family, order, ...) carry direct acceptance votes from CoL, GBIF, etc
+		# and no longer rely on a separate cascade walk to flip the accepted flag
+		db.execute(f"""UPDATE meso SET accepted = TRUE WHERE list_any_value(accepted_by) IS NOT NULL AND kingdom = '{kingdom}';""")
 		# db.sql(f"SELECT id_meso, name_consensus, accepted, synonym, accepted_by, considered_synonym FROM meso WHERE kingdom = '{kingdom}' AND rank_consensus < 'SPECIES'::taxon_rank_enum AND list_any_value(accepted_by) IS NOT NULL;").show(max_rows=200)	
 		# Log
 		mesologger.info(f"""Accepted {db.sql(f"SELECT COUNT(*) FROM meso WHERE kingdom = '{kingdom}' AND accepted").fetchone()[0]:,} {kingdom} taxons""")
@@ -1099,131 +1111,46 @@ def dedupe_names(results: dict, db: duckdb.DuckDBPyConnection, rerun: bool = Fal
 		mesologger.info(f"""Warning, still found duplicate names:""")
 		rows.show(max_rows=40)
 
-# Vote on parents and then add child count to each column
+# Final parent hygiene now that acceptance, dedupe, and parent voting have already run.
+# Direct vote at all ranks captures most of the skeleton; canonical parent dedup is obsolete
+# because dedupe_names already enforces one accepted row per name. The remaining job is
+# (a) a soft cascade for parents that direct vote missed but multiple accepted children still
+# point at, attributed to those children's authorities so accepted_by stays meaningful,
+# (b) dangling parent cleanup, and (c) child counting.
 def consolidate_parents(results: dict, db: duckdb.DuckDBPyConnection):
 	mesologger.info(f"############### Consolidating parents ###############")
-	previous_count = 0
-	# Accept parents
-	while True:
-		# Count candidates
-		rows = db.sql(f"""
-			SELECT id_meso, name_consensus, rank_consensus, parent_consensus
-			FROM meso WHERE accepted
-				AND parent_consensus IS NOT NULL
-				AND rank_consensus != 'KINGDOM'
-				AND parent_consensus IN (SELECT id_meso FROM meso WHERE NOT accepted)
-		""")
-		current_count = len(rows)
-		if rows and current_count > 0: 
-			mesologger.info(f"Looking for {current_count:,} parents")
-			# Log if needed
-			if settings.VERBOSE: rows.show()
-		# Stop when we have no more candidates	
-		else: break	
-		# Update, we try to for as long as possible to not mark synonyms as accepted parents, but have to eventually
-		# because some sources have their parents accepted while other sources define them as synonyms
+	# Soft cascade: promote unaccepted parents that have ANY accepted children currently pointing
+	# at them, attributing acceptance to the union of those children's authorities. This preserves
+	# the invariant that every accepted row has non-empty accepted_by (no "cascade-only" rows) while
+	# recovering parents like phytophthora that direct vote alone leaves unaccepted.
+	previous_count = -1
+	for _ in range(20):
+		# Find unaccepted rows referenced by accepted children
+		cands = db.execute(f"""
+			SELECT m.id_meso, list_distinct(flatten(array_agg(c.accepted_by))) AS inherited_acc
+			FROM meso m
+			JOIN meso c ON c.parent_consensus = m.id_meso AND c.accepted
+			WHERE NOT m.accepted AND m.rank_consensus != 'KINGDOM'
+			GROUP BY m.id_meso
+		""").fetchall()
+		# Stop when there are no more candidates or the count is no longer shrinking
+		if not cands or len(cands) == previous_count: break
+		previous_count = len(cands)
+		mesologger.info(f"Soft-cascade promoting {len(cands):,} parent rows from accepted children")
+		# Persist candidates as a temp table for join-based update
+		db.execute("""DROP TABLE IF EXISTS soft_cascade_candidates;""")
+		db.execute("""CREATE TEMP TABLE soft_cascade_candidates (id_meso UUID, inherited_acc source_enum[]);""")
+		db.executemany("INSERT INTO soft_cascade_candidates VALUES (?, ?)", cands)
+		# Promote: union the children's accepted_by into the parent's accepted_by and flip accepted
 		db.execute(f"""
-			UPDATE meso SET accepted = TRUE 
-			WHERE {'synonym = FALSE AND' if current_count != previous_count else ''} id_meso IN (
-				SELECT parent_consensus FROM meso WHERE accepted
-				AND parent_consensus IS NOT NULL
-				AND rank_consensus != 'KINGDOM'
-				AND parent_consensus IN (SELECT id_meso FROM meso WHERE NOT accepted)
-			);
+			UPDATE meso SET
+				accepted_by = list_distinct(list_concat(COALESCE(meso.accepted_by, ARRAY[]::source_enum[]), c.inherited_acc)),
+				accepted = TRUE
+			FROM soft_cascade_candidates c
+			WHERE meso.id_meso = c.id_meso;
 		""")
-		# Remember count for next round
-		previous_count = current_count
-	mesologger.info("Accepted all parents we could find recursively")
-	# Count filled authority IDs to prefer source-rich parent rows over sparse duplicate-name siblings
-	id_list = ', '.join([
-		f'CAST(m.{auth}_id AS VARCHAR)' if f'{auth}_id' in int_ids else f'm.{auth}_id'
-		for auth in core_authorities
-	])
-	# Dedupe parents
-	db.execute(f"""
-		-- Count referenced parent UUIDs first so parent canonicalization only scans rows that matter
-		CREATE TEMP TABLE parent_refs AS
-		SELECT parent_consensus AS id_meso, COUNT(*) AS ref_count
-		FROM meso
-		WHERE parent_consensus IS NOT NULL
-		GROUP BY parent_consensus;
-		-- Project only referenced parent rows and their ranking signals to avoid a broad self-join
-		CREATE TEMP TABLE parent_rows AS
-		SELECT
-			-- Candidate parent UUID that children may currently point to
-			m.id_meso,
-			-- Duplicate parent names are canonicalized within this key
-			m.name_consensus,
-			-- Prefer parents accepted by more real taxonomy authorities
-			COALESCE(len(m.accepted_by), 0) AS acceptance_count,
-			-- Penalize parents considered synonyms by more authorities
-			COALESCE(len(m.considered_synonym), 0) AS synonym_count,
-			-- Prefer rows with richer cross-source ID coverage when acceptance support ties
-			len(list_filter([{id_list}], lambda x: x IS NOT NULL)) AS authority_count,
-			-- Keep child reference count as a later tie-break without letting polluted references dominate
-			r.ref_count
-		FROM meso m
-		JOIN parent_refs r USING (id_meso);
-		-- First create a temp table for duplicated parents with deterministic authority-first ranking
-		CREATE TEMP TABLE duplicated_parents AS
-		WITH duplicate_parent_names AS (
-			-- Only names with multiple referenced UUIDs need canonical parent selection
-			SELECT name_consensus
-			FROM parent_rows
-			GROUP BY name_consensus
-			HAVING COUNT(DISTINCT id_meso) > 1
-		), ranked_parents AS (
-			SELECT
-				-- Keep the duplicate parent name for later child rewrites
-				p.name_consensus,
-				-- Candidate UUID for this parent name
-				p.id_meso,
-				-- Rank candidates by source support and stable tie-breaks instead of arbitrary MODE
-				ROW_NUMBER() OVER (
-					PARTITION BY p.name_consensus
-					ORDER BY
-						-- Strong multi-authority accepted support should win over sparse siblings
-						p.acceptance_count DESC,
-						-- Richer authority ID coverage is the next best signal for canonical identity
-						p.authority_count DESC,
-						-- Prefer rows that fewer authorities consider synonyms
-						p.synonym_count ASC,
-						-- Use current child convergence only after source-quality signals
-						p.ref_count DESC,
-						-- Finish with UUID ordering so identical inputs produce identical outputs
-						p.id_meso::VARCHAR ASC
-				) AS rn
-			FROM parent_rows p
-			JOIN duplicate_parent_names d USING (name_consensus)
-		)
-		SELECT name_consensus, id_meso AS canonical_id
-		FROM ranked_parents
-		WHERE rn = 1;
-		-- Also create a temp table for non-canonical parents
-		CREATE TEMP TABLE non_canonical_parents AS
-		SELECT m.id_meso AS non_canonical_id, dp.canonical_id
-		FROM duplicated_parents dp
-		JOIN meso m ON m.name_consensus = dp.name_consensus
-		WHERE m.id_meso != dp.canonical_id
-		AND m.id_meso IN (SELECT id_meso FROM parent_refs);
-		-- Update the children to point to canonical parents
-		UPDATE meso SET parent_consensus = dp.canonical_id
-		FROM duplicated_parents dp
-		JOIN meso parent ON parent.name_consensus = dp.name_consensus
-		WHERE meso.parent_consensus = parent.id_meso AND meso.parent_consensus != dp.canonical_id;
-		-- Set accepted=true ONLY for canonical parents
-		UPDATE meso SET accepted = true FROM duplicated_parents dp WHERE meso.id_meso = dp.canonical_id;
-		-- Set accepted=false ONLY for non-canonical parents
-		UPDATE meso SET accepted = false FROM non_canonical_parents ncp WHERE meso.id_meso = ncp.non_canonical_id;
-		-- Drop the temp tables when done
-		DROP TABLE duplicated_parents;
-		DROP TABLE non_canonical_parents;
-		DROP TABLE parent_rows;
-		DROP TABLE parent_refs;
-	""")
-	mesologger.info("Deduplicated parentage")
-	# Run dedupe names again
-	dedupe_names(results,db,True)
+	db.execute("""DROP TABLE IF EXISTS soft_cascade_candidates;""")
+	mesologger.info("Soft cascade complete")
 	# Create accepted IDs / names temp table to reuse / speed up
 	db.execute(f"""
 		CREATE TEMP TABLE accepted_rows AS SELECT 
@@ -1496,15 +1423,27 @@ def vote(results: dict, db: duckdb.DuckDBPyConnection, column: str, authorities:
 					mesologger.info(f"Disqualified {rowcount:,} names from {authority}")
 					if settings.VERBOSE: result.show(max_rows=20)
 			case 'parent_raw':
-				# Replace respective IDs with their meso ID, fastest as measured in commit bbea297
+				# Resolve each authority's parent_raw to the canonical accepted meso row carrying that parent's name.
+				# Acceptance and dedupe have already run, so each (kingdom, name_consensus) has at most one accepted row.
+				# Routing every authority through the canonical accepted row eliminates Erica L. vs Erica Boehm.
+				# style UUID flips in the parent vote without changing the consensus voting machinery itself.
+				# Falls back to the raw m_parent row when no accepted canonical exists, so the soft cascade in
+				# consolidate_parents can later promote useful parents like phytophthora that direct vote missed.
 				db.execute(f"""
 					UPDATE meso SET parent_{authority} = (
-						SELECT m_parent.id_meso FROM {authority} AS i JOIN meso AS m_parent
-						ON m_parent.{authority}_id IS NOT NULL AND i.parent_raw = m_parent.{authority}_id WHERE i.id_raw = meso.{authority}_id LIMIT 1
+						SELECT COALESCE(canonical.id_meso, m_parent.id_meso)
+						FROM {authority} AS i
+						JOIN meso AS m_parent ON m_parent.{authority}_id IS NOT NULL AND i.parent_raw = m_parent.{authority}_id
+						LEFT JOIN meso AS canonical ON canonical.name_consensus = m_parent.name_consensus
+						                           AND canonical.kingdom = m_parent.kingdom
+						                           AND canonical.accepted
+						WHERE i.id_raw = meso.{authority}_id
+						ORDER BY canonical.id_meso IS NULL, m_parent.id_meso::VARCHAR
+						LIMIT 1
 					)
 					WHERE EXISTS (SELECT 1 FROM {authority} WHERE parent_raw IS NOT NULL AND id_raw = meso.{authority}_id);
 				""")
-				mesologger.info(f"Fetched Meso IDs of {authority} parents")
+				mesologger.info(f"Resolved {authority} parent IDs to canonical accepted meso rows (with raw fallback)")
 			case 'rank_clean':
 				# Uppercase rank values to match our enum and skip values outside enum labels
 				db.execute(f"""

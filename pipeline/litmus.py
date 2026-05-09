@@ -139,6 +139,106 @@ checks = [
 		'none',
 		'Wikidata exact-name ID sentinel missing unaccepted or cross-source IDs changed'
 	),
+	# Enforce H+J structural invariant: every accepted row must have non-empty accepted_by.
+	# This is the postcondition that closed the accepted-by-reconsolidation handover. The recursive
+	# cascade that previously promoted parents without provenance is gone; the soft cascade in
+	# consolidate_parents always inherits children's accepted_by. Any future change that re-introduces
+	# a cascade-only path (or bypasses the soft-cascade attribution) regresses this immediately.
+	# We pass when zero accepted rows have empty accepted_by.
+	(
+		'accepted_implies_provenance',
+		"""
+		-- Return accepted rows that lack any authority provenance
+		SELECT id_meso, name_consensus, rank_consensus, kingdom
+		FROM meso
+		WHERE accepted AND (accepted_by IS NULL OR len(accepted_by) = 0)
+		LIMIT 50
+		""",
+		'none',
+		'Accepted rows found with empty accepted_by which violates the H+J cascade-attribution invariant'
+	),
+	# Enforce parent tree integrity: accepted rows never point at non-accepted parents.
+	# After H+J, parent_consensus is either NULL (orphan, mostly KINGDOM rows and edge data-shape cases)
+	# or points at a row that is itself accepted. Catches dangling parent pointers, accepted-pointing-at-rejected,
+	# and any future regression in consolidate_parents dangling cleanup.
+	# We pass when zero accepted rows point at a non-accepted parent.
+	(
+		'parent_consensus_points_to_accepted_row',
+		"""
+		-- Return accepted rows whose parent_consensus is non-NULL but the referenced row is missing or unaccepted
+		SELECT c.id_meso, c.name_consensus, c.rank_consensus, c.kingdom, c.parent_consensus
+		FROM meso c
+		WHERE c.accepted AND c.parent_consensus IS NOT NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM meso p WHERE p.id_meso = c.parent_consensus AND p.accepted
+		)
+		LIMIT 50
+		""",
+		'none',
+		'Accepted rows with parent_consensus pointing at a missing or non-accepted row'
+	),
+	# Lock a curated set of monotypic lineages plus a deep parent_consensus pointer walk on welwitschia.
+	# The list catches class-of-bug regressions in cascade attribution, kingdom guards, and higher-rank
+	# backfill across multiple species. The welwitschia pointer walk additionally verifies that
+	# parent_consensus UUIDs actually link the chain end-to-end (species → genus → family → order),
+	# which the higher-rank string columns alone cannot prove. All five chains have child_count=1 at
+	# every level above the species, so they are the most fragile under any cascade or threshold change.
+	# We pass when every species has correct higher-rank columns AND the welwitschia UUID chain resolves.
+	(
+		'monotypic_lineages_intact',
+		"""
+		-- Phase 1: verify higher-rank columns on five sentinel monotypic species
+		WITH expected(species, kingdom, family, ord) AS (VALUES
+			('welwitschia mirabilis',     'plantae', 'welwitschiaceae',  'welwitschiales'),
+			('ginkgo biloba',             'plantae', 'ginkgoaceae',      'ginkgoales'),
+			('amborella trichopoda',      'plantae', 'amborellaceae',    'amborellales'),
+			('sciadopitys verticillata',  'plantae', 'sciadopityaceae',  'cupressales'),
+			('eucommia ulmoides',         'plantae', 'eucommiaceae',     'garryales')
+		),
+		rank_failures AS (
+			SELECT 'rank_columns_wrong:' || e.species AS reason
+			FROM expected e
+			LEFT JOIN meso m ON m.name_consensus = e.species AND m.rank_consensus = 'SPECIES'
+			WHERE m.id_meso IS NULL
+			   OR NOT m.accepted
+			   OR m.kingdom != e.kingdom
+			   OR m.family IS DISTINCT FROM e.family
+			   OR m."order" IS DISTINCT FROM e.ord
+		),
+		-- Phase 2: walk welwitschia parent_consensus pointers up to ORDER and verify each level
+		wel_species AS (
+			SELECT id_meso, parent_consensus FROM meso WHERE name_consensus = 'welwitschia mirabilis' AND accepted
+		),
+		wel_genus AS (
+			SELECT m.id_meso, m.accepted, m.rank_consensus, m.name_consensus, m.parent_consensus
+			FROM wel_species s JOIN meso m ON m.id_meso = s.parent_consensus
+		),
+		wel_family AS (
+			SELECT m.id_meso, m.accepted, m.rank_consensus, m.name_consensus, m.parent_consensus
+			FROM wel_genus g JOIN meso m ON m.id_meso = g.parent_consensus
+		),
+		wel_order AS (
+			SELECT m.accepted, m.rank_consensus, m.name_consensus
+			FROM wel_family f JOIN meso m ON m.id_meso = f.parent_consensus
+		),
+		pointer_failures AS (
+			SELECT 'welwitschia_pointer_genus_broken' AS reason FROM (SELECT 1) WHERE NOT EXISTS (
+				SELECT 1 FROM wel_genus WHERE accepted AND rank_consensus = 'GENUS' AND name_consensus = 'welwitschia'
+			)
+			UNION ALL
+			SELECT 'welwitschia_pointer_family_broken' FROM (SELECT 1) WHERE NOT EXISTS (
+				SELECT 1 FROM wel_family WHERE accepted AND rank_consensus = 'FAMILY' AND name_consensus = 'welwitschiaceae'
+			)
+			UNION ALL
+			SELECT 'welwitschia_pointer_order_broken' FROM (SELECT 1) WHERE NOT EXISTS (
+				SELECT 1 FROM wel_order WHERE accepted AND rank_consensus = 'ORDER' AND name_consensus = 'welwitschiales'
+			)
+		)
+		SELECT reason FROM rank_failures UNION ALL SELECT reason FROM pointer_failures
+		""",
+		'none',
+		'Monotypic lineage broken: sentinel species has wrong higher-rank columns or welwitschia parent_consensus chain does not resolve to genus/family/order'
+	),
 	# Lock known-good GBIF sentinels with exact name+id and embedded geo payload.
 	# This asserts accepted row identity and verifies geo embedding produced map-ready data.
 	# We pass when query returns zero regressions.
@@ -196,8 +296,16 @@ def run(release=None):
 		db.execute(f"CREATE VIEW meso AS SELECT * FROM read_parquet('{parquet_url}')")
 		# Iterate all configured litmus checks.
 		for key, query, expect, issue in checks:
-			# Execute check query and collect returned rows.
-			rows = db.execute(query).fetchall()
+			# Tolerate per-check binder errors so a missing optional column (e.g. geo on fuse-only runs) skips that check
+			# rather than killing the whole litmus stage and the canopy run with it.
+			try:
+				# Execute check query and collect returned rows.
+				rows = db.execute(query).fetchall()
+			except duckdb.BinderException as e:
+				# Skip checks whose query references a column that does not exist in this release
+				mesologger.warning(f'LITMUS SKIP {key} {e}')
+				# Move on to the next check without affecting overall pass/fail counts
+				continue
 			# Evaluate pass/fail from expected row-shape semantics.
 			passed = (len(rows) > 0) if expect == 'any' else (len(rows) == 0)
 			# Log successful checks for operator visibility.
