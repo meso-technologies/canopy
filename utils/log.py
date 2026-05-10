@@ -2,6 +2,8 @@
 import logging
 # Load environment helpers for optional sentry setup
 import os
+# Load stdout/stderr helpers for broken-pipe safe console logging
+import sys
 # Load subprocess helpers for git release discovery
 import subprocess
 # Load json encoding for optional structured payload output
@@ -28,6 +30,23 @@ class CanopyHandler(logging.Handler):
 		self.platform = platform
 		# Track whether previous log used carriage-return same-line mode
 		self.sameline_active = False
+		# Stop console writes after stdout closes during operator-terminated runs
+		self.console_broken = False
+
+	# Write one console fragment while tolerating closed stdout pipes
+	def _safe_print(self, *args, **kwargs):
+		# Skip console output once stdout is known closed
+		if self.console_broken: return
+		# Try normal console output first
+		try: print(*args, **kwargs)
+		# Suppress broken pipe noise from killed systemd/tee/journal streams
+		except BrokenPipeError:
+			# Mark console as unavailable for remaining log records
+			self.console_broken = True
+			# Redirect stdout to devnull so any external print fallback does not recurse noisily
+			try: sys.stdout = open(os.devnull, 'w')
+			# Ignore devnull redirect failures because logging must never crash the process
+			except Exception: pass
 
 	# Emit one fully formatted console log line
 	def emit(self, record):
@@ -46,15 +65,15 @@ class CanopyHandler(logging.Handler):
 		# Print same-line progress updates with carriage return
 		if sameline:
 			# Render progress line without newline for in-place updates
-			print(line, end='\r', flush=True)
+			self._safe_print(line, end='\r', flush=True)
 			# Mark active same-line mode for next non-sameline message
 			self.sameline_active = True
 		# Otherwise print regular newline-terminated log line
 		else:
 			# Close previous same-line progress row before normal output
-			if self.sameline_active: print()
+			if self.sameline_active: self._safe_print()
 			# Print normal line with newline terminator
-			print(line)
+			self._safe_print(line)
 			# Reset same-line tracking after normal line
 			self.sameline_active = False
 		# Pull structured payload if provided by caller
@@ -64,11 +83,11 @@ class CanopyHandler(logging.Handler):
 			# Ensure payload starts on a clean line after same-line progress
 			if self.sameline_active:
 				# Finish same-line mode before payload output
-				print()
+				self._safe_print()
 				# Reset same-line tracking after explicit line break
 				self.sameline_active = False
 			# Print payload as pretty JSON
-			print(json.dumps(payload, indent=2, default=str))
+			self._safe_print(json.dumps(payload, indent=2, default=str))
 
 	# Map python logging levels to ANSI console colors
 	def _color(self, levelno):
