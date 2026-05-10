@@ -20,11 +20,9 @@ dependencies = [
 	"requests",
 	"boto3",
 	"fsspec",
-	"pandas"
+	"pandas",
+	"sentry-sdk"
 ]
-
-[project.optional-dependencies]
-sentry = ["sentry-sdk"]
 
 [tool.setuptools]
 package-dir = {"importer" = ".."}

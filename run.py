@@ -1,5 +1,5 @@
 # Load traceback helpers for readable failure output
-from .utils.log import mesologger, mesologger_setup
+from .utils.log import mesologger, mesologger_setup, mesologger_flush
 import traceback
 # Load process exit helper for non-zero failure signaling
 import sys
@@ -273,5 +273,11 @@ if __name__ == '__main__':
 		mesologger.error(f'Unhandled error {type(e).__name__}: {e}.')
 		# Emit stack for debugging unexpected top-level failures
 		traceback.print_stack()
+		# Flush Sentry before short-lived process exit
+		mesologger_flush()
 		# Exit non-zero so wrapper orchestration can stop safely
 		sys.exit(1)
+	# Always flush Sentry logs after successful standalone runs too
+	finally:
+		# Flush any queued Sentry logs without changing process outcome
+		mesologger_flush()

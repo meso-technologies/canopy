@@ -1,6 +1,18 @@
 # Canopy
 
-Canopy builds a unified taxonomy release from multiple botanical and mycological authorities. It keeps source provenance visible, reconciles differences in acceptance and classification, and produces practical outputs for search, hierarchy browsing, and geospatial enrichment.
+Canopy builds a unified taxonomy from multiple botanical and mycological authorities. 
+
+It's consensus driven, meaning that core values like authorship, year, acceptance etc are being voted on, so whenever one of the underlying source datasets changes, the taxonomy automatically updates to reflect those changes.
+
+Aside from producing a single consistent taxonomy representing the majority consensus of 550k accepted plants and 200k fungi, it includes the following highlights:
+
+- Normalized and deduplicated vernacular names in over 300 languages, sorted by frequency across source datasets.
+- GeoJSON distribution, most representative climatic centroids, hypsograms, median elevations, and native occurrence coordinates as well as child rollups for any taxon that has occurrences.
+- Direct links to a variety of BHL pages (first mention, illustrations etc).
+- External taxonomy IDs from 11 primary sources matched directly, plus 16 backfilled from Wikidata.
+- English Wikipedia abstracts.
+
+System requirements: runs fine on average laptops, but needs 500GB for full Wikidata/GBIF dataset parsing, and 32GB RAM recommended to compute in-memory. Total runtime about 12 minutes (excluding downloads).
 
 ## Examples
 
@@ -39,6 +51,7 @@ uv run python -m importer.canopy.run --debug --process --fuse
 
 - `CANOPY_DATA_DIR` — override canopy data root directory (default: `canopy/data`).
 - `CANOPY_USER_AGENT` — outbound HTTP `User-Agent` string for source/API requests (default: `Canopy Taxonomy Pipeline/1.0 (opensource@meso.cloud)`).
+- `CANOPY_SENTRY_DSN` — optional Sentry DSN for standalone error/log reporting (default: disabled).
 
 ## Setup & Secrets
 
