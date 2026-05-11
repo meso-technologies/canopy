@@ -2,7 +2,7 @@
 
 Canopy builds a unified taxonomy from multiple botanical and mycological authorities. 
 
-It's consensus driven, meaning that core values like authorship, year, acceptance etc are being voted on, so whenever one of the underlying source datasets changes, the taxonomy automatically updates to reflect those changes.
+It's consensus driven, meaning that core values like authorship, year, acceptance, parentage etc are being voted on, so every value is being driven by constant changes in the underlying authority datasets.
 
 Aside from producing a single consistent taxonomy representing the majority consensus of 550k accepted plants and 200k fungi, it includes the following highlights:
 
