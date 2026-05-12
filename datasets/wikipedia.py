@@ -80,13 +80,20 @@ def build_abstracts(release: dict, db: duckdb.DuckDBPyConnection, update_only: b
 		updated_rowcount = db.execute("SELECT COUNT(*) FROM wikipedia_abstracts").fetchone()[0]
 		mesologger.info(f"Added {int(updated_rowcount-existing_rowcount):,} additional candidates by ID")
 		current_count = db.execute("SELECT COUNT(*) FROM wikipedia_abstracts WHERE abstract IS NOT NULL;").fetchone()[0]
-		# Look for ID matches 
+		# Limit routine refreshes so one stale cohort cannot dominate runtime
+		refresh_limit = 100 if settings.DEBUG else 20000
+		# Refresh the oldest stale taxon abstracts first, with random spread across timestamp ties
 		db.execute(f"""
 			UPDATE wikipedia_abstracts SET 
 				abstract = NULLIF(download_abstracts(en_page_title),''),
 				last_checked = transaction_timestamp()
-			WHERE en_page_title IS NOT NULL AND (last_checked IS NULL OR last_checked < transaction_timestamp() - INTERVAL '2 weeks')
-			{ 'LIMIT 100' if settings.DEBUG else '' };
+			WHERE rowid IN (
+				SELECT rowid
+				FROM wikipedia_abstracts
+				WHERE en_page_title IS NOT NULL AND (last_checked IS NULL OR last_checked < transaction_timestamp() - INTERVAL '2 weeks')
+				ORDER BY last_checked NULLS FIRST, random()
+				LIMIT {refresh_limit}
+			);
 		""")
 		by_id_count = db.execute("SELECT COUNT(*) FROM wikipedia_abstracts WHERE abstract IS NOT NULL").fetchone()[0]
 		differential = int(by_id_count-current_count)
