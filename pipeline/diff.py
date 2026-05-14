@@ -59,6 +59,8 @@ MESO_DIFF_PROFILE = {
 	'name_col': 'name_consensus',
 	# Render consensus rank in sidecar entries
 	'rank_col': 'rank_consensus',
+	# Track canonical meso ids for stable staff-dashboard redirects
+	'meso_id_col': 'id_meso',
 	# Track only agreed meso change fields from consensus output
 	'cols': ['author_consensus', 'year_consensus', 'parent_consensus', 'iucn_status'],
 	# Prefilter both releases to accepted scope before joining by name
@@ -192,16 +194,18 @@ def _diff_profile(db, profile, cur_path, cur_parquet, prev_path, prev_parquet):
 	id_col = profile.get('id_col', 'id_raw')
 	name_col = profile.get('name_col', 'name_clean')
 	rank_col = profile.get('rank_col', 'rank_clean')
+	# Resolve optional canonical meso id column for linkable sidecar entries
+	meso_id_col = profile.get('meso_id_col')
 	# Resolve tracked column list from profile
 	cols = profile.get('cols', [])
 	# Resolve optional mode that prefilters scope before joining
 	prefilter_scope = bool(profile.get('prefilter_scope', False))
 	# First-release path when no baseline or predecessor parquet is missing
-	if not prev_path or not storage.exists(prev_path): return _diff_first_release(db, kind, cur_path, id_col=id_col, name_col=name_col, rank_col=rank_col)
+	if not prev_path or not storage.exists(prev_path): return _diff_first_release(db, kind, cur_path, id_col=id_col, name_col=name_col, rank_col=rank_col, meso_id_col=meso_id_col)
 	# Unchanged-file shortcut when baseline and current processed artifact filenames match
 	if cur_parquet == prev_parquet: return _diff_unchanged(kind, prev_parquet)
 	# Full diff path runs parametric FOJ query across both parquets
-	return _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col=id_col, name_col=name_col, rank_col=rank_col, cols=cols, prefilter_scope=prefilter_scope)
+	return _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col=id_col, name_col=name_col, rank_col=rank_col, cols=cols, prefilter_scope=prefilter_scope, meso_id_col=meso_id_col)
 
 # Emit zero-counts block when source parquet is identical between releases
 def _diff_unchanged(kind, prev_parquet):
@@ -221,7 +225,7 @@ def _diff_unchanged(kind, prev_parquet):
 	return diff_block, sidecar
 
 # Emit all-new diff when no baseline release exists for this profile
-def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clean', rank_col='rank_clean'):
+def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', meso_id_col=None):
 	# Build scope expression for first-release counting under the source's kind
 	scope_expr = 'accepted' if kind == 'authority' else 'TRUE'
 	# Resolve backend-aware parquet URL for DuckDB (local path or s3:// URL)
@@ -233,7 +237,7 @@ def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clea
 	# Respect sample cap so a 1.78M-row first IPNI release does not produce a 140 MB sidecar
 	cap = SAMPLE_CAP
 	# Collect capped sample entries mirroring the full-diff entry shape
-	samples = _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col=id_col, name_col=name_col, rank_col=rank_col)
+	samples = _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col=id_col, name_col=name_col, rank_col=rank_col, meso_id_col=meso_id_col)
 	# Flag truncation when current scope exceeds sample cap
 	truncated = cur_count > cap
 	# Build scalar block with first-release semantics
@@ -251,7 +255,7 @@ def _diff_first_release(db, kind, cur_path, id_col='id_raw', name_col='name_clea
 	return diff_block, sidecar
 
 # Run the parametric full-outer-join diff query for one profile
-def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', cols=None, prefilter_scope=False):
+def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', cols=None, prefilter_scope=False, meso_id_col=None):
 	# Resolve scope expression once so it participates in both CTEs and samples
 	scope_expr = 'accepted' if kind == 'authority' else 'TRUE'
 	# Resolve scope WHERE predicate once so null acceptance is treated as false
@@ -267,6 +271,8 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 	id_expr = f"{id_col}::VARCHAR"
 	name_expr = f"{name_col}" if _column_exists(db, cur_path, name_col) and _column_exists(db, prev_path, name_col) else 'NULL::VARCHAR'
 	rank_expr = f"{rank_col}" if _column_exists(db, cur_path, rank_col) and _column_exists(db, prev_path, rank_col) else 'NULL::VARCHAR'
+	# Build optional canonical meso id projection for stable UI redirects
+	meso_expr = f"{meso_id_col}::VARCHAR" if meso_id_col and _column_exists(db, cur_path, meso_id_col) and _column_exists(db, prev_path, meso_id_col) else 'NULL::VARCHAR'
 	# Build per-column DISTINCT FROM expressions for "changed" detection
 	distinct_exprs = [f"c.{col} IS DISTINCT FROM p.{col}" for col in tracked_cols]
 	# Combine DISTINCT FROM expressions into one OR chain
@@ -297,13 +303,13 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 	query = f"""
 		WITH c AS (
 			SELECT {id_expr} AS id_key, {acc_expr} AS acc,
-				   {name_expr} AS name_value, {rank_expr} AS rank_value{tracked_select}
+				   {name_expr} AS name_value, {rank_expr} AS rank_value, {meso_expr} AS meso_id_value{tracked_select}
 			FROM read_parquet($cur)
 			{c_where}
 		),
 		p AS (
 			SELECT {id_expr} AS id_key, {acc_expr} AS acc,
-				   {name_expr} AS name_value, {rank_expr} AS rank_value{tracked_select}
+				   {name_expr} AS name_value, {rank_expr} AS rank_value, {meso_expr} AS meso_id_value{tracked_select}
 			FROM read_parquet($prev)
 			{p_where}
 		),
@@ -316,6 +322,7 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 				END AS category,
 				COALESCE(c.name_value, p.name_value) AS name,
 				COALESCE(c.rank_value, p.rank_value) AS rank,
+				COALESCE(c.meso_id_value, p.meso_id_value) AS meso_id,
 				-- Fields list is only meaningful on changed entries where both sides exist
 				{fields_case} AS diff_fields
 			FROM c FULL OUTER JOIN p USING (id_key)
@@ -323,7 +330,7 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 		SELECT
 			category,
 			COUNT(*) AS cnt,
-			list(struct_pack(id := id, name := name, rank := rank, fields := diff_fields))[1:{SAMPLE_CAP}] AS samples
+			list(struct_pack(id := id, name := name, rank := rank, meso_id := meso_id, fields := diff_fields))[1:{SAMPLE_CAP}] AS samples
 		FROM tagged
 		WHERE category IS NOT NULL
 		GROUP BY category
@@ -396,22 +403,24 @@ def _common_columns(db, cur_path, prev_path, candidates):
 
 # Collect capped first-release samples mirroring full-diff entry shape
 
-def _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col='id_raw', name_col='name_clean', rank_col='rank_clean'):
+def _collect_first_release_samples(db, cur_path, cap, scope_expr, id_col='id_raw', name_col='name_clean', rank_col='rank_clean', meso_id_col=None):
 	# Resolve backend-aware parquet URL for DuckDB reads
 	cur_parquet_url = _duck_path(cur_path)
 	# Build optional rank expression when rank column is absent on the current parquet
 	rank_expr = rank_col if _column_exists(db, cur_path, rank_col) else 'NULL'
 	# Build optional name expression when name column is absent on the current parquet
 	name_expr = name_col if _column_exists(db, cur_path, name_col) else 'NULL'
+	# Build optional meso id expression when the release carries canonical ids
+	meso_expr = f"{meso_id_col}::VARCHAR" if meso_id_col and _column_exists(db, cur_path, meso_id_col) else 'NULL::VARCHAR'
 	# Run bounded SELECT with LIMIT to avoid loading massive first-release datasets into Python
 	rows = db.execute(f"""
-		SELECT {id_col}::VARCHAR AS id, {name_expr} AS name, {rank_expr} AS rank
+		SELECT {id_col}::VARCHAR AS id, {name_expr} AS name, {rank_expr} AS rank, {meso_expr} AS meso_id
 		FROM read_parquet($cur)
 		WHERE COALESCE({scope_expr}, FALSE)
 		LIMIT {cap}
 	""", {'cur': cur_parquet_url}).fetchall()
 	# Build entry dicts dropping rank when NULL for consistency with _normalize_entry
-	return [_normalize_entry({'id': r[0], 'name': r[1], 'rank': r[2]}) for r in rows]
+	return [_normalize_entry({'id': r[0], 'name': r[1], 'rank': r[2], 'meso_id': r[3]}) for r in rows]
 
 # Slice sample arrays to the applicable cap and normalize DuckDB struct rows to dicts
 def _cap_samples(samples, cap):
@@ -426,6 +435,8 @@ def _normalize_entry(entry):
 	out = {'id': entry.get('id'), 'name': entry.get('name')}
 	# Include rank when non-null for UI triage
 	if entry.get('rank') is not None: out['rank'] = entry['rank']
+	# Include canonical meso id when available for stable UI redirects
+	if entry.get('meso_id') is not None: out['meso_id'] = entry['meso_id']
 	# Include fields only when changed-detection produced at least one match
 	fields = entry.get('fields')
 	if fields: out['fields'] = list(fields)
