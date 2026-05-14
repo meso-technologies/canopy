@@ -8,12 +8,8 @@ from .. import PROCESSED_DIR, SRC_DIR, TMP_DIR, RELEASES_DIR, settings
 from ..utils.downloader import pull, get_local_source_file
 # Load shared storage proxy for local/S3 transparent file operations
 from ..utils.s3 import storage
-from ..utils.manifest import get_diff_sidecar
 # Load run-state helper to persist latest source download/process metadata
 from ..utils.state import update_source_state
-
-# Track distilled release artifact prefixes for cleanup logic
-releasefiles = ['precog','typesense','postgres','taxonext','authors','citations','timeline','rarities','diff']
 
 # Fetch source metadata, optionally download updates, and decide whether processing is needed
 async def fetch(session, source: dict) -> bool:
@@ -209,42 +205,6 @@ def get_previous_release(current_version, release_dir=None):
 	if not older: return None
 	# Delegate manifest loading to shared primitive using most recent predecessor
 	return get_release(older[-1], release_dir)
-
-# Remove stale hashed release artifacts that are no longer referenced by manifest
-def cleanup_release(dir, manifest):
-	# Full dir
-	release_dir = os.path.join(dir,manifest.get('version'))
-	# Prevent the most stupid mistakes
-	if len(str(release_dir)) < 3:
-		mesologger.warning(f"WARNING, TRIED TO DELETE FILES IN { release_dir }")
-		return
-	# Log
-	mesologger.info(f"Cleaning up release dir {release_dir}")
-	try:
-		# Build referenced artifact filename list once with nested diff.sidecar support
-		current_files = []
-		# Iterate known release artifact keys and collect referenced filenames
-		for key in releasefiles:
-			# Skip missing artifact keys in sparse manifests
-			if key not in manifest: continue
-			# Resolve nested diff sidecar filename through shared manifest helper
-			if key == 'diff':
-				sidecar = get_diff_sidecar(manifest)
-				if isinstance(sidecar, str): current_files.append(sidecar)
-			# Keep legacy direct string filenames for all artifact keys
-			elif isinstance(manifest.get(key), str): current_files.append(manifest[key])
-		for file in storage.list_files(release_dir):
-			# Build full path for deletion via storage backend
-			full_path = os.path.join(release_dir, file)
-			# Ignore other files, make sure to use delimiting dot as we have wikispecies-foo etc
-			if not file.split('.')[0] in releasefiles: continue
-			# Check if it's a file we actually want to keep
-			if file in current_files: continue
-			# Delete if we made it all the way here
-			mesologger.info(f"Deleting old file { release_dir }/{ file }")
-			storage.delete(full_path)
-	except Exception as e:
-		mesologger.error(f"Unable to delete file in { release_dir } {type(e).__name__ } { e }.")	
 
 ################## Parallel processing of very large gzip files like Wikidata from here on ###########################	
 
