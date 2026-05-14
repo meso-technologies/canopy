@@ -13,7 +13,7 @@ from ..utils.manifest import get_diff_sidecar
 from ..utils.state import update_source_state
 
 # Track distilled release artifact prefixes for cleanup logic
-releasefiles = ['precog','typesense','postgres','taxonext','citations','timeline','rarities','diff']
+releasefiles = ['precog','typesense','postgres','taxonext','authors','citations','timeline','rarities','diff']
 
 # Fetch source metadata, optionally download updates, and decide whether processing is needed
 async def fetch(session, source: dict) -> bool:
