@@ -284,8 +284,18 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 		field_cases.append(f"CASE WHEN c.{col} IS DISTINCT FROM p.{col} THEN '{col}' END")
 	# Combine into a list-building expression that drops NULLs
 	fields_expr = f"list_filter([{', '.join(field_cases)}], x -> x IS NOT NULL)" if field_cases else "[]"
-	# Project tracked columns into one joined table for downstream tagging
-	tracked_select = ', ' + ', '.join(tracked_cols) if tracked_cols else ''
+	# Add stable context columns to rekey matching when sources expose them
+	rekey_context_cols = [col for col in _common_columns(db, cur_path, prev_path, ['parent_raw', 'status_clean']) if col not in tracked_cols]
+	# Match source-id rekeys on tracked diff fields plus stable context so hidden parent/status flips are not collapsed
+	rekey_cols = tracked_cols + rekey_context_cols
+	# Project tracked and rekey-context columns into one joined table for downstream tagging
+	tracked_select = ', ' + ', '.join(rekey_cols) if rekey_cols else ''
+	# Enable generic source-id rekey detection only for source diffs keyed by id_raw
+	rekey_enabled = id_col == 'id_raw' and not prefilter_scope and bool(rekey_cols)
+	# Build equality predicates for matching new/deleted rows whose content did not change
+	rekey_join = ' AND '.join([f"n.{col} IS NOT DISTINCT FROM d.{col}" for col in rekey_cols]) if rekey_enabled else 'FALSE'
+	# Build partition keys for uniqueness guards on candidate rekey signatures
+	rekey_partition = ', '.join(rekey_cols) if rekey_enabled else 'id_key'
 	# Build CTE WHERE clauses so meso can prefilter accepted rows before joining
 	c_where = f"WHERE {scope_where}" if prefilter_scope else ''
 	p_where = f"WHERE {scope_where}" if prefilter_scope else ''
@@ -313,8 +323,39 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 			FROM read_parquet($prev)
 			{p_where}
 		),
+		new_candidates AS (
+			SELECT c.*
+			FROM c LEFT JOIN p USING (id_key)
+			WHERE {'(p.id_key IS NULL OR NOT p.acc) AND c.acc' if rekey_enabled else 'FALSE'}
+		),
+		deleted_candidates AS (
+			SELECT p.*
+			FROM p LEFT JOIN c USING (id_key)
+			WHERE {'p.acc AND (c.id_key IS NULL OR NOT c.acc)' if rekey_enabled else 'FALSE'}
+		),
+		unique_new AS (
+			SELECT *
+			FROM new_candidates
+			QUALIFY COUNT(*) OVER (PARTITION BY {rekey_partition}) = 1
+		),
+		unique_deleted AS (
+			SELECT *
+			FROM deleted_candidates
+			QUALIFY COUNT(*) OVER (PARTITION BY {rekey_partition}) = 1
+		),
+		rekeys AS (
+			SELECT n.id_key AS id,
+				d.id_key AS old_id,
+				n.name_value AS name,
+				n.rank_value AS rank,
+				n.meso_id_value AS meso_id,
+				['id_raw'] AS diff_fields
+			FROM unique_new n JOIN unique_deleted d ON {rekey_join}
+			WHERE n.id_key IS DISTINCT FROM d.id_key
+		),
 		tagged AS (
 			SELECT COALESCE(c.id_key, p.id_key) AS id,
+				NULL::VARCHAR AS old_id,
 				CASE
 					{new_case}
 					{deleted_case}
@@ -326,13 +367,26 @@ def _diff_full(db, kind, cur_path, prev_path, prev_parquet, id_col='id_raw', nam
 				-- Fields list is only meaningful on changed entries where both sides exist
 				{fields_case} AS diff_fields
 			FROM c FULL OUTER JOIN p USING (id_key)
+		),
+		filtered_tagged AS (
+			SELECT *
+			FROM tagged t
+			WHERE category IS NOT NULL
+			AND NOT (category = 'new' AND EXISTS (SELECT 1 FROM rekeys r WHERE r.id = t.id))
+			AND NOT (category = 'deleted' AND EXISTS (SELECT 1 FROM rekeys r WHERE r.old_id = t.id))
+		),
+		combined AS (
+			SELECT category, id, old_id, name, rank, meso_id, diff_fields
+			FROM filtered_tagged
+			UNION ALL
+			SELECT 'changed' AS category, id, old_id, name, rank, meso_id, diff_fields
+			FROM rekeys
 		)
 		SELECT
 			category,
 			COUNT(*) AS cnt,
-			list(struct_pack(id := id, name := name, rank := rank, meso_id := meso_id, fields := diff_fields))[1:{SAMPLE_CAP}] AS samples
-		FROM tagged
-		WHERE category IS NOT NULL
+			list(struct_pack(id := id, old_id := old_id, name := name, rank := rank, meso_id := meso_id, fields := diff_fields))[1:{SAMPLE_CAP}] AS samples
+		FROM combined
 		GROUP BY category
 	"""
 	# Execute diff in one pass against both parquets
@@ -435,6 +489,8 @@ def _normalize_entry(entry):
 	out = {'id': entry.get('id'), 'name': entry.get('name')}
 	# Include rank when non-null for UI triage
 	if entry.get('rank') is not None: out['rank'] = entry['rank']
+	# Include previous source id for rekey-only changes so operators can see the old upstream id
+	if entry.get('old_id') is not None: out['old_id'] = entry['old_id']
 	# Include canonical meso id when available for stable UI redirects
 	if entry.get('meso_id') is not None: out['meso_id'] = entry['meso_id']
 	# Include fields only when changed-detection produced at least one match
